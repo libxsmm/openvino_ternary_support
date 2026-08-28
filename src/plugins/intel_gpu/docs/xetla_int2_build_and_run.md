@@ -148,6 +148,20 @@ not a general dynamic-shape capture API: a production implementation must
 invalidate or update a captured list when its layouts, state buffers, or input
 contracts change.
 
+For Lunar Lake integrated GPUs, the up-convert dispatcher selects separate
+decode tiles rather than reusing the B70 table. The tuned Bonsai-8B choices are:
+
+| Shape `(K, N)` | Operation | LNL tile `(WGN, KS, LS)` |
+|---|---|---|
+| `(4096, 6144)` | QKV | `(32, 1, 1)` |
+| `(4096, 24576)` | merged gate/up | `(256, 1, 1)` |
+| `(12288, 4096)` | down projection | `(32, 1, 2)` |
+| `(4096, 151680)` | lm_head | `(128, 1, 2)` |
+
+With `max_new_tokens=256` and `BENCH_NO_EOS=1`, this native ZE path produced
+255 timed decode tokens at 35.7--35.9 tok/s on LNL. The 256 generated IDs for
+the photosynthesis chat prompt matched the B70 OpenCL XeTLA result exactly.
+
 ---
 
 ## 5. Prepare a model

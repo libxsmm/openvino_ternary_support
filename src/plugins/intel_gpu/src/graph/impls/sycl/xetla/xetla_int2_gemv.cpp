@@ -457,6 +457,12 @@ bool int2_upcvt_gemm_ze_run(ze_command_list_handle_t list,
 }
 #endif
 
+bool is_integrated_gpu(const sycl::device& device) {
+  const auto name = device.get_info<sycl::info::device::name>();
+  return name.find("Arc(TM) Graphics") != std::string::npos &&
+         name.find("Pro") == std::string::npos;
+}
+
 } // namespace
 
 // -- Public entry point: pick a precompiled variant based on (M, N) ----------
@@ -551,6 +557,14 @@ sycl::event int2_upcvt_gemm_run(
         case 11: DISPATCH(128, 1, 8);
         default: break;
       }
+    }
+    // The integrated Xe2 device has substantially less bandwidth and needs
+    // shallower K slicing than the discrete B70 tiles below.
+    if (is_integrated_gpu(q.get_device())) {
+      if (K == 4096 && N == 6144)        { DISPATCH(32, 1, 1); }
+      else if (K == 4096 && N == 24576)  { DISPATCH(256, 1, 1); }
+      else if (K == 12288 && N == 4096)  { DISPATCH(32, 1, 2); }
+      else if (K == 4096 && N == 151680) { DISPATCH(128, 1, 2); }
     }
     // ----- Tuned GEMV shapes for a 4096-wide hidden size.
     // Format: (K, N) -> (WGN, KS, LS).
@@ -694,6 +708,7 @@ bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
     cached_context.emplace(sycl::make_context<sycl::backend::ext_oneapi_level_zero>(context_input));
     cached_context_handle = ze_context;
   }
+  const bool integrated_gpu = is_integrated_gpu(*cached_device);
 #define DIRECT_RUN(WGN_, KS_, LS_, CT_, POSTOP_)                                           \
   return int2_upcvt_gemm_ze_run<fp16, WGN_, KS_, LS_, CT_, POSTOP_>(                       \
       static_cast<ze_command_list_handle_t>(list), ze_context, ze_device,                  \
@@ -708,24 +723,44 @@ bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
   }
 
   if (out_f32) {
-    if (K == 4096 && N == 151680)
-      DIRECT_RUN(32, 1, 4, float, 0);
+    if (K == 4096 && N == 151680) {
+      if (integrated_gpu) {
+        DIRECT_RUN(128, 1, 2, float, 0);
+      } else {
+        DIRECT_RUN(32, 1, 4, float, 0);
+      }
+    }
     return false;
   }
 
   if (M > 1)
     DIRECT_F16(128, 1, 1);
 
-  if (K == 4096 && N == 6144)
-    DIRECT_F16(32, 1, 4);
+  if (K == 4096 && N == 6144) {
+    if (integrated_gpu) {
+      DIRECT_F16(32, 1, 1);
+    } else {
+      DIRECT_F16(32, 1, 4);
+    }
+  }
   if (K == 4096 && N == 4096)
     DIRECT_F16(32, 1, 8);
   if (K == 4096 && N == 12288)
     DIRECT_F16(32, 1, 2);
-  if (K == 4096 && N == 24576)
-    DIRECT_F16(32, 1, 4);
-  if (K == 12288 && N == 4096)
-    DIRECT_F16(32, 1, 8);
+  if (K == 4096 && N == 24576) {
+    if (integrated_gpu) {
+      DIRECT_F16(256, 1, 1);
+    } else {
+      DIRECT_F16(32, 1, 4);
+    }
+  }
+  if (K == 12288 && N == 4096) {
+    if (integrated_gpu) {
+      DIRECT_F16(32, 1, 2);
+    } else {
+      DIRECT_F16(32, 1, 8);
+    }
+  }
 #undef DIRECT_F16
 #undef DIRECT_RUN
   return false;
