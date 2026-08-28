@@ -10,6 +10,9 @@
 #if OV_GPU_WITH_ONEDNN
     #include "impls/onednn/fully_connected_onednn.hpp"
 #endif
+#if OV_GPU_WITH_SYCL
+    #include "impls/sycl/fully_connected_xetla_int2.hpp"
+#endif
 
 namespace ov::intel_gpu {
 
@@ -21,6 +24,8 @@ const std::vector<std::shared_ptr<cldnn::ImplementationManager>>& Registry<fully
     };
 
     static const std::vector<std::shared_ptr<ImplementationManager>> impls = {
+        OV_GPU_CREATE_INSTANCE_SYCL_OCL(cldnn::sycl::XetlaInt2FCImplementationManager, shape_types::dynamic_shape)
+        OV_GPU_CREATE_INSTANCE_SYCL_OCL(cldnn::sycl::XetlaInt2FCImplementationManager, shape_types::static_shape)
         OV_GPU_CREATE_INSTANCE_ONEDNN(onednn::FullyConnectedImplementationManager, shape_types::static_shape)
         OV_GPU_GET_INSTANCE_OCL(fully_connected, shape_types::static_shape, ocl_supports_weights_layout)
         OV_GPU_GET_INSTANCE_OCL(fully_connected, shape_types::dynamic_shape,
