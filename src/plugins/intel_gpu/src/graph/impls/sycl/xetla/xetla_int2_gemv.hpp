@@ -26,6 +26,12 @@ sycl::event gemv_f16(sycl::queue& q, size_t M, size_t N, size_t K,
                      void* A, void* B, void* C, void* ScaleB, size_t slot = 0,
                      int postop = 0, void* other = nullptr, bool out_f32 = false);
 
+// Experimental native ZE entry point used to validate direct command-list
+// launch of the named up-convert kernel.
+bool gemv_f16_ze_probe(void* list, void* context, void* device, size_t M, size_t N, size_t K,
+                       void* A, void* B, void* C, void* ScaleB, size_t slot = 0,
+                       int postop = 0, void* other = nullptr, bool out_f32 = false);
+
 // Same operands, but quantizes the activations to int8 and uses the int2 x int8
 // DPAS instead of up-converting the weights to fp16. Twice the compute peak, at
 // the cost of an activation abs-max pass.

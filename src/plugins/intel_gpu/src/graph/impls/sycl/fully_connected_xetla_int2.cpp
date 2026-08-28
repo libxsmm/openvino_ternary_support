@@ -7,14 +7,23 @@
 #include "data_inst.h"
 #include "fully_connected_inst.h"
 #include "intel_gpu/runtime/memory.hpp"
+#ifdef OV_GPU_WITH_ZE_RT
+#    include "ze/ze_engine.hpp"
+#    include "ze/ze_common.hpp"
+#    include "ze/ze_stream.hpp"
+#else
 #include "ocl/sycl_engine.hpp"
 #include "ocl/sycl_stream.hpp"
+#endif
 #include "primitive_sycl_base.h"
 #include "reorder_inst.h"
 #include "registry/implementation_map.hpp"
 #include "xetla/xetla_int2_gemv.hpp"
 
 #include <sycl/sycl.hpp>
+#ifdef OV_GPU_WITH_ZE_RT
+#    include <sycl/ext/oneapi/backend/level_zero.hpp>
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -37,6 +46,24 @@ using ov::intel_gpu::xetla_int2::kPackFactor;
 // OpenVINO stores u2 little-endian inside each byte: value j at bits [2j, 2j+1].
 inline uint8_t read_u2(const uint8_t* base, size_t index) {
     return static_cast<uint8_t>((base[index >> 2] >> (2 * (index & 0x3))) & 0x3);
+}
+
+::sycl::queue xetla_queue(stream& stream) {
+#ifdef OV_GPU_WITH_ZE_RT
+    auto& ze_stream = downcast<ze::ze_stream>(stream);
+    const auto cmd_list = ze_stream.get_queue();
+    const auto& engine = ze_stream.get_engine();
+
+    auto device = ::sycl::make_device<::sycl::backend::ext_oneapi_level_zero>(engine.get_device().handle());
+    ::sycl::backend_input_t<::sycl::backend::ext_oneapi_level_zero, ::sycl::context> context_input{
+        engine.get_context().handle(), {device}, ::sycl::ext::oneapi::level_zero::ownership::keep};
+    auto context = ::sycl::make_context<::sycl::backend::ext_oneapi_level_zero>(context_input);
+    ::sycl::backend_input_t<::sycl::backend::ext_oneapi_level_zero, ::sycl::queue> queue_input{
+        cmd_list, device, ::sycl::ext::oneapi::level_zero::ownership::keep};
+    return ::sycl::make_queue<::sycl::backend::ext_oneapi_level_zero>(queue_input, context);
+#else
+    return downcast<ocl::sycl_stream>(stream).get_sycl_queue();
+#endif
 }
 
 // [N, K] u2 codes -> [K/16, N] int32, re-encoding (code - zp) to the kernel's
@@ -121,8 +148,11 @@ static std::mutex& xetla_int2_packed_mutex() {
 }
 
 static std::unordered_map<std::string, XetlaInt2Packed>& xetla_int2_packed_cache() {
-    static std::unordered_map<std::string, XetlaInt2Packed> c;
-    return c;
+    // The cache owns ZE allocations, but the plugin can be unloaded after the
+    // ZE context. Keep it process-lifetime to avoid freeing stale allocations
+    // during C++ static destruction.
+    static auto* c = new std::unordered_map<std::string, XetlaInt2Packed>;
+    return *c;
 }
 
 struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
@@ -163,8 +193,7 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         // getenv is not free and this runs once per FullyConnected per token.
         static const bool dbg = std::getenv("OV_XETLA_INT2_DEBUG") != nullptr;
         auto& network = instance.get_network();
-        auto& stream = downcast<ocl::sycl_stream>(network.get_stream());
-        ::sycl::queue& sycl_queue = stream.get_sycl_queue();
+        auto& stream = network.get_stream();
 
         const auto& params = instance.get_impl_params();
         const auto out_shape = params->output_layouts[0].get_shape();
@@ -189,12 +218,6 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
             if (e)
                 e->wait();
         }
-
-        // Ordering against other xetla FCs comes from the in-order queue. Kept as
-        // an escape hatch: OV_XETLA_INT2_BARRIER=1 forces an explicit barrier.
-        static const bool force_barrier = std::getenv("OV_XETLA_INT2_BARRIER") != nullptr;
-        if (force_barrier)
-            sycl_queue.submit([=](::sycl::handler& cgh) { cgh.ext_oneapi_barrier(); });
 
         void* out_ptr = instance.output_memory_ptr(0)->buffer_ptr();
 
@@ -274,6 +297,39 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
             fuse_silu = false;
             elt_other = nullptr;
         }
+
+#ifdef OV_GPU_WITH_ZE_RT
+    if (std::getenv("OV_XETLA_INT2_ZE_DIRECT") != nullptr ||
+        std::getenv("OV_XETLA_INT2_ZE_DIRECT_QKV") != nullptr) {
+            auto& ze_stream = downcast<ze::ze_stream>(stream);
+            const bool ok = ov::intel_gpu::xetla_int2::gemv_f16_ze_probe(
+                ze_stream.get_queue(), ze_stream.get_engine().get_context().handle(),
+                ze_stream.get_engine().get_device().handle(), M, n_pad, _K,
+                instance.input_memory_ptr(0)->buffer_ptr(), packed_weights->buffer_ptr(),
+                gemm_out, scales->buffer_ptr(), _slot, postop, postop_other, native_f32);
+            OPENVINO_ASSERT(ok, "[GPU] xetla int2: direct ZE launch failed");
+            if (staging) {
+                const size_t element_size = native_f32 ? sizeof(float) : sizeof(::sycl::half);
+                const size_t row_bytes = _N * element_size;
+                const size_t padded_row_bytes = n_pad * element_size;
+                auto* src = static_cast<const char*>(gemm_out);
+                auto* dst = static_cast<char*>(out_ptr);
+                for (size_t row = 0; row < M; ++row) {
+                    OV_ZE_EXPECT(ze::zeCommandListAppendMemoryCopy(
+                        ze_stream.get_queue(), dst + row * row_bytes, src + row * padded_row_bytes,
+                        row_bytes, nullptr, 0, nullptr));
+                }
+            }
+            return nullptr;
+        }
+#endif
+
+        auto sycl_queue = xetla_queue(stream);
+        // Ordering against other xetla FCs comes from the in-order queue. Kept as
+        // an escape hatch: OV_XETLA_INT2_BARRIER=1 forces an explicit barrier.
+        static const bool force_barrier = std::getenv("OV_XETLA_INT2_BARRIER") != nullptr;
+        if (force_barrier)
+            sycl_queue.submit([=](::sycl::handler& cgh) { cgh.ext_oneapi_barrier(); });
 
         auto ev = use_dpas
                       ? ov::intel_gpu::xetla_int2::gemv_f16_dpas(sycl_queue, M, n_pad, _K,

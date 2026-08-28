@@ -15,10 +15,17 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <tuple>
 #include <utility>
+
+#ifdef OV_GPU_WITH_ZE_RT
+#    include <level_zero/ze_api.h>
+#    include <sycl/ext/oneapi/backend/level_zero.hpp>
+#    include "ze/ze_common.hpp"
+#endif
 
 #include "xetla.hpp"
 
@@ -163,6 +170,105 @@ sycl::event int2_upcvt_gemm_impl(
   });
 }
 
+#ifdef OV_GPU_WITH_ZE_RT
+template <
+    typename XT, int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned, typename CT = XT, int POSTOP = 0>
+bool int2_upcvt_gemm_ze_probe(
+  ze_command_list_handle_t list, const sycl::context& context, const sycl::device& device,
+  const size_t M, const size_t N, const size_t K,
+    XT* A_d, int32_t* B_d, CT* C_d, XT* ScaleB_d,
+    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr) {
+  using data_type_a = XT;
+  using data_type_b = int2x16;
+  using data_type_c = CT;
+  using data_type_acc = float;
+  using data_type_scale = XT;
+  constexpr gpu_arch arch_tag = gpu_arch::Xe;
+  using tile_shape = gpu::xetla::group::tile_shape_t<WGN, WGM, SGN, SGM>;
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<data_type_c, mem_layout::row_major, mem_space::global>;
+  using compute_attr = gpu::xetla::group::compute_attr_t<data_type_a, data_type_a, data_type_acc>;
+  using perf_tuning_knob = gpu::xetla::group::perf_tuning_knob_t<SGK, 0, 0>;
+  using compute_policy = gpu::xetla::group::compute_policy_int2_fp16_upcvt_xmx<
+      compute_attr, perf_tuning_knob, data_type_scale, kScaleGS, SGM, arch_tag, kUnaligned>;
+  using gemm_t = gpu::xetla::group::gemm_t<compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+    using silu_t = gpu::xetla::subgroup::silu_op_t;
+    using prod_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
+      gpu::xetla::reduce_op::prod, XT, arch_tag>;
+    using sum_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
+      gpu::xetla::reduce_op::sum, XT, arch_tag>;
+    using tile_op_t = std::conditional_t<
+      POSTOP == 1, gpu::xetla::subgroup::chained_tile_op_t<silu_t, prod_t>,
+      gpu::xetla::subgroup::chained_tile_op_t<sum_t>>;
+    using epilogue_policy_t = std::conditional_t<
+      POSTOP != 0, gpu::xetla::group::epilogue_policy_tile_op<tile_op_t, arch_tag>,
+      std::conditional_t<
+        kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+        gpu::xetla::group::epilogue_policy_default<arch_tag>>>;
+    using mem_desc_c_epilogue_t = std::conditional_t<
+      kUnaligned,
+      gpu::xetla::mem_desc_t<data_type_c, mem_layout::row_major, mem_space::global, 1>,
+      mem_desc_c_t>;
+    using epilogue_t = gpu::xetla::group::epilogue_t<epilogue_policy_t, tile_shape, mem_desc_c_epilogue_t>;
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_int2_fp16_upcvt_kslicing<group_swizzle, KS, LS>, gemm_t, epilogue_t>;
+  using kernel_name_t = int2_upcvt_kernel_tag<XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned, CT, POSTOP>;
+
+    auto make_args = [&]() {
+    if constexpr (POSTOP == 0) {
+      return typename gemm_op_t::arguments_t(
+        static_cast<uint32_t>(M), static_cast<uint32_t>(K), static_cast<uint32_t>(N),
+        A_d, static_cast<uint32_t>(K), reinterpret_cast<int2x16*>(B_d), static_cast<uint32_t>(N),
+        C_d, static_cast<uint32_t>(N), ScaleB_d, static_cast<uint32_t>(N), Acc_d, Cnt_d);
+    } else {
+      using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
+      typename reduce_t::arguments_t other_args(
+        Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M), static_cast<uint32_t>(N)});
+      typename tile_op_t::arguments_t tile_args;
+      tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      typename epilogue_t::arguments_t epilogue_args(tile_args);
+      return typename gemm_op_t::arguments_t(
+        static_cast<uint32_t>(M), static_cast<uint32_t>(K), static_cast<uint32_t>(N),
+        A_d, static_cast<uint32_t>(K), reinterpret_cast<int2x16*>(B_d), static_cast<uint32_t>(N),
+        C_d, static_cast<uint32_t>(N), ScaleB_d, static_cast<uint32_t>(N), Acc_d, Cnt_d, epilogue_args);
+    }
+    };
+    typename gemm_op_t::arguments_t args = make_args();
+  if (!gemm_op_t::can_implement(args))
+    return false;
+  const auto range = gemm_op_t::get_nd_range(args);
+  using bundle_t = sycl::kernel_bundle<sycl::bundle_state::executable>;
+  static std::mutex kernel_mutex;
+  static std::optional<bundle_t> bundle;
+  static ze_context_handle_t bundle_context = nullptr;
+  static ze_kernel_handle_t kernel = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(kernel_mutex);
+    const auto native_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context);
+    if (kernel == nullptr || bundle_context != native_context) {
+      bundle.emplace(sycl::get_kernel_bundle<sycl::bundle_state::executable>(
+          context, {device}, {sycl::get_kernel_id<kernel_name_t>()}));
+      auto sycl_kernel = bundle->get_kernel(sycl::get_kernel_id<kernel_name_t>());
+      kernel = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_kernel);
+      bundle_context = native_context;
+    }
+  }
+  std::lock_guard<std::mutex> launch_lock(kernel_mutex);
+  const auto local = range.get_local_range();
+  const auto global = range.get_global_range();
+  cldnn::ze::zeKernelSetGroupSize(kernel, local[2], local[1], local[0]);
+  cldnn::ze::zeKernelSetArgumentValue(kernel, 0, sizeof(args), &args);
+  ze_group_count_t groups = {static_cast<uint32_t>(global[2] / local[2]),
+                             static_cast<uint32_t>(global[1] / local[1]),
+                             static_cast<uint32_t>(global[0] / local[0])};
+  const auto result = cldnn::ze::zeCommandListAppendLaunchKernel(list, kernel, &groups, nullptr, 0, nullptr);
+  return result == ZE_RESULT_SUCCESS;
+}
+#endif
+
 // Get a scratch (Acc, Cnt) buffer pair sized for the worst case across the
 // instantiations we precompile (KS, LS up to 4). The kslicing kernel writes
 // per-WG accumulators into Acc and uses Cnt as a barrier counter, so we
@@ -280,6 +386,76 @@ std::pair<size_t, size_t> upcvt_scratch_bytes(size_t M, size_t N) {
   size_t cnt_elems = gemm_op_t::get_cnt_buf_size(M, N);
   return {acc_elems * sizeof(data_type_acc), cnt_elems * sizeof(uint32_t)};
 }
+
+#ifdef OV_GPU_WITH_ZE_RT
+bool get_direct_ze_scratch(ze_command_list_handle_t list,
+                           ze_context_handle_t context,
+                           ze_device_handle_t device,
+                           size_t acc_bytes,
+                           size_t cnt_bytes,
+                           float*& acc,
+                           uint32_t*& cnt) {
+  struct scratch_t {
+    ze_context_handle_t context = nullptr;
+    float* acc = nullptr;
+    uint32_t* cnt = nullptr;
+    size_t acc_bytes = 0;
+    size_t cnt_bytes = 0;
+  };
+  static scratch_t scratch;
+  static std::mutex scratch_mutex;
+  std::lock_guard<std::mutex> lock(scratch_mutex);
+
+  if (scratch.context != context || scratch.acc_bytes < acc_bytes || scratch.cnt_bytes < cnt_bytes) {
+    ze_device_mem_alloc_desc_t desc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
+    void* new_acc = nullptr;
+    void* new_cnt = nullptr;
+    if (cldnn::ze::zeMemAllocDevice(context, &desc, acc_bytes, 256, device, &new_acc) != ZE_RESULT_SUCCESS ||
+        cldnn::ze::zeMemAllocDevice(context, &desc, cnt_bytes, 256, device, &new_cnt) != ZE_RESULT_SUCCESS)
+      return false;
+
+    const uint32_t zero = 0;
+    if (cldnn::ze::zeCommandListAppendMemoryFill(list, new_acc, &zero, sizeof(zero), acc_bytes, nullptr, 0, nullptr) !=
+            ZE_RESULT_SUCCESS ||
+        cldnn::ze::zeCommandListAppendMemoryFill(list, new_cnt, &zero, sizeof(zero), cnt_bytes, nullptr, 0, nullptr) !=
+            ZE_RESULT_SUCCESS)
+      return false;
+
+    scratch.context = context;
+    scratch.acc = static_cast<float*>(new_acc);
+    scratch.cnt = static_cast<uint32_t*>(new_cnt);
+    scratch.acc_bytes = acc_bytes;
+    scratch.cnt_bytes = cnt_bytes;
+  }
+
+  acc = scratch.acc;
+  cnt = scratch.cnt;
+  return true;
+}
+
+template <typename XT, int WGN, int KS, int LS, typename CT = XT, int POSTOP = 0>
+bool int2_upcvt_gemm_ze_run(ze_command_list_handle_t list,
+                            ze_context_handle_t ze_context,
+                            ze_device_handle_t ze_device,
+                            const sycl::context& context,
+                            const sycl::device& device,
+                            size_t M,
+                            size_t N,
+                            size_t K,
+                            XT* A,
+                            int32_t* B,
+                            CT* C,
+                            XT* ScaleB,
+                            XT* Other = nullptr) {
+  const auto need = upcvt_scratch_bytes<XT, 1, WGN, 1, 16, 128, KS, LS, false>(M, N);
+  float* acc = nullptr;
+  uint32_t* cnt = nullptr;
+  if (!get_direct_ze_scratch(list, ze_context, ze_device, need.first, need.second, acc, cnt))
+    return false;
+  return int2_upcvt_gemm_ze_probe<XT, 1, WGN, 1, 16, 128, KS, LS, false, CT, POSTOP>(
+      list, context, device, M, N, K, A, B, C, ScaleB, acc, cnt, Other);
+}
+#endif
 
 } // namespace
 
@@ -495,6 +671,80 @@ sycl::event gemv_f16(sycl::queue& q, size_t M, size_t N, size_t K,
     default:
       return int2_upcvt_gemm_run<fp16, fp16, 0>(q, M, N, K, a, b, c, s, slot, o);
   }
+}
+
+bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
+                       size_t M, size_t N, size_t K,
+                       void* A, void* B, void* C, void* ScaleB, size_t,
+                       int postop, void* other, bool out_f32) {
+#ifdef OV_GPU_WITH_ZE_RT
+  using fp16 = gpu::xetla::fp16;
+  static std::mutex context_mutex;
+  static ze_context_handle_t cached_context_handle = nullptr;
+  static std::optional<sycl::device> cached_device;
+  static std::optional<sycl::context> cached_context;
+  std::lock_guard<std::mutex> lock(context_mutex);
+  const auto ze_context = static_cast<ze_context_handle_t>(context_handle);
+  const auto ze_device = static_cast<ze_device_handle_t>(device_handle);
+  if (cached_context_handle != ze_context) {
+    cached_device.emplace(sycl::make_device<sycl::backend::ext_oneapi_level_zero>(ze_device));
+    sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::context> context_input{
+      ze_context, {*cached_device},
+      sycl::ext::oneapi::level_zero::ownership::keep};
+    cached_context.emplace(sycl::make_context<sycl::backend::ext_oneapi_level_zero>(context_input));
+    cached_context_handle = ze_context;
+  }
+#define DIRECT_RUN(WGN_, KS_, LS_, CT_, POSTOP_)                                           \
+  return int2_upcvt_gemm_ze_run<fp16, WGN_, KS_, LS_, CT_, POSTOP_>(                       \
+      static_cast<ze_command_list_handle_t>(list), ze_context, ze_device,                  \
+      *cached_context, *cached_device, M, N, K,                                             \
+      static_cast<fp16*>(A), static_cast<int32_t*>(B), static_cast<CT_*>(C),               \
+      static_cast<fp16*>(ScaleB), static_cast<fp16*>(other))
+#define DIRECT_F16(WGN_, KS_, LS_)                                                          \
+  switch (postop) {                                                                         \
+    case 1: DIRECT_RUN(WGN_, KS_, LS_, fp16, 1);                                            \
+    case 2: DIRECT_RUN(WGN_, KS_, LS_, fp16, 2);                                            \
+    default: DIRECT_RUN(WGN_, KS_, LS_, fp16, 0);                                           \
+  }
+
+  if (out_f32) {
+    if (K == 4096 && N == 151680)
+      DIRECT_RUN(32, 1, 4, float, 0);
+    return false;
+  }
+
+  if (M > 1)
+    DIRECT_F16(128, 1, 1);
+
+  if (K == 4096 && N == 6144)
+    DIRECT_F16(32, 1, 4);
+  if (K == 4096 && N == 4096)
+    DIRECT_F16(32, 1, 8);
+  if (K == 4096 && N == 12288)
+    DIRECT_F16(32, 1, 2);
+  if (K == 4096 && N == 24576)
+    DIRECT_F16(32, 1, 4);
+  if (K == 12288 && N == 4096)
+    DIRECT_F16(32, 1, 8);
+#undef DIRECT_F16
+#undef DIRECT_RUN
+  return false;
+#else
+  (void)list;
+  (void)context_handle;
+  (void)device_handle;
+  (void)M;
+  (void)N;
+  (void)K;
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)ScaleB;
+  (void)postop;
+  (void)other;
+  (void)out_f32;
+  return false;
+#endif
 }
 
 }  // namespace xetla_int2

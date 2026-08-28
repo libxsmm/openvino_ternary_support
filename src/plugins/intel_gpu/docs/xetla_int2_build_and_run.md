@@ -96,6 +96,58 @@ Confirm the path is compiled in:
 strings bin/intel64/Release/libopenvino_intel_gpu_plugin.so | grep -c OV_XETLA_INT2   # non-zero
 ```
 
+### Experimental native Level Zero path
+
+The native Level Zero XeTLA path is an experimental follow-up to the OpenCL
+runtime path above. Build it in a separate output directory with oneAPI 2025.3;
+the 2026.0 Unified Runtime adapter is incompatible with the tested B70 driver.
+
+```bash
+source <intel-gpu-runtime>/intel_gpu_vars.sh
+source <oneapi-2025.3>/oneapi-vars.sh
+
+cmake -B build-ze-20253 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DGPU_RT_TYPE=ZE -DOUTPUT_ROOT=$PWD/build-ze-20253 \
+  -DENABLE_INTEL_CPU=OFF -DENABLE_INTEL_NPU=OFF \
+  -DENABLE_PYTHON=OFF -DENABLE_SAMPLES=OFF -DENABLE_TESTS=OFF \
+  -DENABLE_ONEDNN_FOR_GPU=OFF -DENABLE_CM_FOR_GPU=ON \
+  -DTHREADING=TBB_ADAPTIVE
+cmake --build build-ze-20253 -j $(nproc)
+```
+
+The build may copy a newer `libze_loader.so` into its output directory than the
+installed GPU driver supports. Remove that copied loader before running so the
+plugin resolves the system loader supplied with the GPU runtime:
+
+```bash
+rm -f build-ze-20253/bin/intel64/Release/libze_loader.so*
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+```
+
+For native ZE experiments on a shared environment, start with a clean runtime
+environment to prevent unrelated Python-distribution libraries from shadowing
+oneAPI:
+
+```bash
+srun --export=NONE -p <gpu-partition> /bin/bash -lc '...'
+```
+
+The experimental switches are intentionally opt-in:
+
+| Variable | Effect |
+|---|---|
+| `OV_XETLA_INT2_ZE_DIRECT=1` | Append the supported int2 XeTLA GEMVs directly to the plugin's native ZE command list. `OV_XETLA_INT2_ZE_DIRECT_QKV=1` remains an alias. |
+| `OV_ZE_REGULAR_LIST=1` | Use a mutable-capable regular ZE command list instead of an immediate list. |
+| `OV_ZE_REPLAY_LIST=1` | After recording prefill and one decode iteration, replay the stable decode list. Requires `OV_ZE_REGULAR_LIST=1`. |
+| `OV_XETLA_INT2_MERGE_MLP=1` | Merge parallel gate/up compressed FCs into a 2I FC followed by the existing SwiGLU primitive. |
+
+These switches are validated for the listed Bonsai int2 benchmark only. They are
+not a general dynamic-shape capture API: a production implementation must
+invalidate or update a captured list when its layouts, state buffers, or input
+contracts change.
+
 ---
 
 ## 5. Prepare a model

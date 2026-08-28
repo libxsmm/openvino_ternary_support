@@ -39,6 +39,10 @@
 #include "program_dump_graph.h"
 #include "to_string_utils.h"
 
+#ifdef OV_GPU_WITH_ZE_RT
+#    include "ze/ze_stream.hpp"
+#endif
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -940,6 +944,12 @@ bool network::has_event(const primitive_id& id) const {
 }
 
 void network::execute_impl(const std::vector<event::ptr>& events) {
+#ifdef OV_GPU_WITH_ZE_RT
+    if (auto* ze_stream = dynamic_cast<ze::ze_stream*>(&get_stream()); ze_stream && ze_stream->begin_replay()) {
+        get_stream().finish();
+        return;
+    }
+#endif
     set_arguments();
 
     // This extra flush command is needed for dynamic models in both cases of out_of_order / in_order operating mode

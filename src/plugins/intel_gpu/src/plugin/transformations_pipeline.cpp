@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -1613,9 +1614,12 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         const bool disable_horizontal_fc_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_horizontal_fc_fusion(), false);
         const bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_fc_swiglu_fusion(), false);
 
-        // mlp fusion is only supported for cldnn on high performant GPUis
-        bool fuse_mlp_swiglu = !config.get_use_onednn() &&
-                               !device_info.supports_immad &&
+        // The systolic FC epilogue does not natively consume a SwiGLU, but the
+        // XeTLA int2 experiment can benchmark the merged 2I projection followed
+        // by the existing SwiGLU primitive.
+        const bool xetla_merge_mlp = std::getenv("OV_XETLA_INT2_MERGE_MLP") != nullptr;
+        bool fuse_mlp_swiglu = (!config.get_use_onednn() || xetla_merge_mlp) &&
+                               (!device_info.supports_immad || xetla_merge_mlp) &&
                                device_info.execution_units_count >= 128 &&
                                !disable_fc_swiglu_fusion;
         if (!disable_horizontal_fc_fusion) {
