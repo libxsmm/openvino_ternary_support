@@ -176,6 +176,13 @@ Per-token GPU kernel time for the region drops from about 506 us (363 us of
 RMSNorm plus 143 us of RoPE) to about 303 us (146 us of the remaining
 non-attention RMSNorms plus 157 us of fused RoPE).
 
+On Lunar Lake with native ZE, the same indirect-SDPA configuration is
+token-identical and improves from 35.88 to 36.09 tok/s. The transformed paged
+attention harness is also token-identical there, but is currently slower on the
+integrated GPU: 26.56 tok/s without replay and 22.24 tok/s with replay. Keep
+the indirect path on LNL until its paged-attention and regular-list paths are
+tuned for the integrated architecture.
+
 For Lunar Lake integrated GPUs, the up-convert dispatcher selects separate
 decode tiles rather than reusing the B70 table. The tuned Bonsai-8B choices are:
 
