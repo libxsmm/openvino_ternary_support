@@ -97,6 +97,7 @@
 #include "plugin/transformations/fc_horizontal_fusion.hpp"
 #include "plugin/transformations/fold_activation_transpose.hpp"
 #include "plugin/transformations/fuse_gated_mlp.hpp"
+#include "plugin/transformations/fuse_rms_rope.hpp"
 #include "plugin/transformations/fuse_atan2_decomposed.hpp"
 #include "plugin/transformations/fuse_moe_router.hpp"
 #include "plugin/transformations/fuse_moe_router_scale.hpp"
@@ -1529,6 +1530,10 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         pass_config->disable<ov::pass::RoPEFusionGPTJ>();
         pass_config->disable<ov::pass::RoPEFusionIOSlicing>();
         pass_config->disable<ov::pass::RoPEShareCosSin>();
+
+        if (std::getenv("OV_GPU_FUSE_RMS_ROPE")) {
+            manager.register_pass<ov::intel_gpu::FuseRMSRoPE>();
+        }
 
         manager.register_pass<ov::intel_gpu::IncreasePositionIdsPrecision>();
         manager.register_pass<ov::intel_gpu::FuseAtan2Decomposed>();

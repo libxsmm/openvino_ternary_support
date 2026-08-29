@@ -142,11 +142,39 @@ The experimental switches are intentionally opt-in:
 | `OV_ZE_REGULAR_LIST=1` | Use a mutable-capable regular ZE command list instead of an immediate list. |
 | `OV_ZE_REPLAY_LIST=1` | After recording prefill and one decode iteration, replay the stable decode list. Requires `OV_ZE_REGULAR_LIST=1`. |
 | `OV_XETLA_INT2_MERGE_MLP=1` | Merge parallel gate/up compressed FCs into a 2I FC followed by the existing SwiGLU primitive. |
+| `OV_GPU_FUSE_RMS_ROPE=1` | Fold the per-head Q/K RMSNorm into the following RoPE kernel. `OV_GPU_DEBUG_RMS_ROPE=1` traces the match. |
 
 These switches are validated for the listed Bonsai int2 benchmark only. They are
 not a general dynamic-shape capture API: a production implementation must
 invalidate or update a captured list when its layouts, state buffers, or input
 contracts change.
+
+### Fused Q/K RMSNorm and RoPE
+
+Bonsai normalizes every attention head before the rotary embedding, so decode
+runs 72 small RMSNorm kernels whose only consumer is a RoPE kernel. With
+`OV_GPU_FUSE_RMS_ROPE=1` the RMSNorm is folded into the RoPE kernel: the
+normalization weights become RoPE input 3, and each work group reduces one head
+in local memory before rotating it, so the intermediate tensor is never written.
+
+The transformation only fires for the shape it can prove: fp16, a rotate-half
+RoPE covering the whole head, no gather or slice, and an RMSNorm with static
+per-head weights whose sole consumer is that RoPE. It accepts both the form
+where a view separates the two ops and the form where `RoPEFusionPreprocess` has
+already absorbed the transpose. The kernel mirrors `rms_gpu_bfyx_opt.cl`
+arithmetic, so generated tokens are identical to the unfused path.
+
+Measured on B70 with the Bonsai-8B u2 model, 255 timed decode steps, native ZE
+plus merged MLP, all runs token-identical to the unfused reference:
+
+| Path | Unfused | Fused |
+|---|---|---|
+| stateful indirect SDPA | 143.27 tok/s | 146.53 tok/s |
+| paged attention with list replay | 144.32 tok/s | 148.71 tok/s |
+
+Per-token GPU kernel time for the region drops from about 506 us (363 us of
+RMSNorm plus 143 us of RoPE) to about 303 us (146 us of the remaining
+non-attention RMSNorms plus 157 us of fused RoPE).
 
 For Lunar Lake integrated GPUs, the up-convert dispatcher selects separate
 decode tiles rather than reusing the B70 table. The tuned Bonsai-8B choices are:
