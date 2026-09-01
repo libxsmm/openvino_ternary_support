@@ -698,6 +698,12 @@ sycl::event int2_upcvt_gemm_run(
   if (M >= 128 && N % 128 == 0) {
     DISPATCH_GEMM(32, 8, 128, 128, 32);
   }
+  // A 128-wide workgroup tile over a much narrower output (the GatedDeltaNet
+  // beta projection is N=48) asks for more than an integrated device grants and
+  // the enqueue fails with CL_OUT_OF_RESOURCES; match the tile to the output.
+  if (N <= 64) {
+    DISPATCH_RAW(32, 1, 1);
+  }
   DISPATCH_RAW(128, 1, 1);
 #undef DISPATCH_GEMM
 #undef DISPATCH
