@@ -254,6 +254,45 @@ and still generates fluent text.
 
 ---
 
+### 5.3 Checkpoints with a tied output projection
+
+Bonsai 1.7B and 4B set `tie_word_embeddings`, so `lm_head` aliases the embedding
+and the export carries no separate weight for it. The head then stays dense and
+is never compressed. Bonsai's embedding is itself ternary, so give the head its
+own copy first and it packs like every other projection, matching the 8B and 27B
+which ship untied:
+
+```bash
+./venv_export/bin/python src/plugins/intel_gpu/tools/xetla_int2/untie_embeddings.py \
+  --in <checkpoint> --out <checkpoint>-untied
+```
+
+Export from the untied directory. `verify_ternary_u2.py` reports whether the
+head ended up compressed.
+
+### 5.4 Verifying the conversion
+
+```bash
+./venv/bin/python src/plugins/intel_gpu/tools/xetla_int2/verify_ternary_u2.py \
+  --fp16 <model-fp16>/openvino_model.xml \
+  --u2   <model-u2>/openvino_model.xml
+```
+
+It reconstructs every compressed weight and reports the error, which is exactly
+zero when each 128-element group holds a single magnitude. Measured:
+
+| Model | Compressed MatMuls | Head compressed | Max abs error | Groups with >1 magnitude |
+|---|---|---|---|---|
+| 1.7B | 197 | yes (after untying) | 9.77e-04 | 740 / 13.4M (0.0055%) |
+| 4B | 253 | yes (after untying) | 9.77e-04 | 1643 / 31.4M (0.0052%) |
+| 8B | 253 | yes | 0 | 0 |
+| 27B | 497 | yes | 0 | 0 |
+
+The 1.7B and 4B residual is not a group-size mismatch: their native scale group
+is 128 as well, but a few thousand groups store two fp16 magnitudes a few ULPs
+apart, so taking the maximum moves the other one. The relative error is 0.78% on
+0.005% of groups.
+
 ## 6. Run
 
 Any OpenVINO application picks the implementation up automatically; no API
@@ -315,17 +354,26 @@ Useful environment variables:
 
 ### Measured results
 
-256 tokens, `BENCH_NO_EOS=1`, OpenCL runtime, all six runs token-identical:
+256 tokens, `BENCH_NO_EOS=1`, OpenCL runtime. Within a model the paths are
+token-identical, and each model produces the same tokens on both GPUs:
 
-| Configuration | B70 | Lunar Lake |
-|---|---|---|
-| 8B, paged | 147.4 tok/s | 36.3 tok/s |
-| 27B, paged | 45.0 tok/s | 7.4 tok/s |
-| 27B, stateful + static decode | 41.3 tok/s | 6.6 tok/s |
+| Model | Path | B70 | Lunar Lake |
+|---|---|---|---|
+| 1.7B | indirect | 296.2 | 114.4 |
+| 1.7B | paged | 359.7 | 118.9 |
+| 4B | indirect | 173.8 | 57.7 |
+| 4B | paged | 180.1 | 58.4 |
+| 8B | paged | 147.4 | 36.3 |
+| 27B | paged | 45.0 | 7.4 |
+| 27B | stateful + static decode | 41.3 | 6.6 |
 
-On B70 the paged path is reliably ahead for both models. On Lunar Lake the two
-27B paths are within run-to-run variance of each other, so neither is a
-recommended default there.
+Paged is ahead on every model on B70. On Lunar Lake it leads clearly for 1.7B
+and 4B, while the two 27B paths sit within run-to-run variance of each other.
+
+Compare paths only at an identical prompt: `bench_llm` defaults to a prompt with
+the assistant and `<think>` suffix while `paged_bench_llm` does not, so leaving
+the argument off makes the two disagree from the first token for reasons that
+have nothing to do with the kernels.
 
 ```
 bench_llm <model.xml> <device> [max_new_tokens] [comma-separated input ids]

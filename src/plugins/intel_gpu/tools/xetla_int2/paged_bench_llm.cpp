@@ -73,7 +73,6 @@ int main(int argc, char** argv) {
     constexpr int32_t max_context_len = 512;
     constexpr int32_t block_size = 16;
     constexpr int32_t num_blocks = max_context_len / block_size;
-    constexpr int32_t layer_count = 36;
 
     if (prompt.empty() || static_cast<int32_t>(prompt.size()) + max_new_tokens > max_context_len) {
         std::cerr << "prompt plus generated tokens must fit the " << max_context_len << " token cache\n";
@@ -96,19 +95,34 @@ int main(int argc, char** argv) {
 
         auto request = compiled.create_infer_request();
         auto context = compiled.get_context();
+
+        // Layer count and cache geometry vary per model, and the plugin's
+        // ConvertPagedAttnInputs pass has already fixed the shapes, so read both
+        // off the compiled model rather than assuming one architecture.
+        int32_t layer_count = 0;
+        for (const auto& port : compiled.inputs()) {
+            for (const auto& name : port.get_names()) {
+                if (name.rfind("key_cache.", 0) == 0)
+                    ++layer_count;
+            }
+        }
+        std::cout << "paged layers: " << layer_count << '\n';
+
         std::vector<ov::RemoteTensor> caches;
         caches.reserve(layer_count * 2);
+        auto bind = [&](const std::string& name) {
+            const auto port = compiled.input(name);
+            const auto partial = port.get_partial_shape();
+            ov::Shape shape(partial.size());
+            for (size_t i = 0; i < partial.size(); ++i)
+                shape[i] = partial[i].is_dynamic() ? static_cast<size_t>(num_blocks)
+                                                   : static_cast<size_t>(partial[i].get_length());
+            caches.emplace_back(context.create_tensor(port.get_element_type(), shape));
+            request.set_tensor(name, caches.back());
+        };
         for (int32_t layer = 0; layer < layer_count; ++layer) {
-            const std::string key_name = "key_cache." + std::to_string(layer);
-            const std::string value_name = "value_cache." + std::to_string(layer);
-            const auto key_port = compiled.input(key_name);
-            const auto value_port = compiled.input(value_name);
-            caches.emplace_back(context.create_tensor(
-                key_port.get_element_type(), ov::Shape{num_blocks, 8, 128, block_size}));
-            request.set_tensor(key_name, caches.back());
-            caches.emplace_back(context.create_tensor(
-                value_port.get_element_type(), ov::Shape{num_blocks, 8, block_size, 128}));
-            request.set_tensor(value_name, caches.back());
+            bind("key_cache." + std::to_string(layer));
+            bind("value_cache." + std::to_string(layer));
         }
 
         set_i32_scalar(request, "max_context_len", max_context_len);
