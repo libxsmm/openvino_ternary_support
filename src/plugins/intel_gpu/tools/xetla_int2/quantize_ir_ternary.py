@@ -24,6 +24,20 @@ def pack_u2(codes: np.ndarray) -> np.ndarray:
     return (q[:, 0] | (q[:, 1] << 2) | (q[:, 2] << 4) | (q[:, 3] << 6)).astype(np.uint8)
 
 
+def to_f32(const) -> np.ndarray:
+    """Constant data as fp32, decoding bf16 by hand.
+
+    numpy has no bf16, so Constant.get_data() hands back a float16-typed *view*
+    of the raw bf16 bits rather than a conversion. Reading that as fp16 keeps the
+    ternary codes (the sign is bit 15 either way) but corrupts every group scale,
+    which is silent: the model loads and generates fluent nonsense.
+    """
+    raw = const.get_data()
+    if const.get_output_element_type(0) == ov.Type.bf16:
+        return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    return raw.astype(np.float32)
+
+
 def ternary_quantize(w: np.ndarray):
     """w is [N, K] fp32. Returns u2 codes [N, K] and fp16 scales [N, K/GROUP]."""
     n, k = w.shape
@@ -65,7 +79,7 @@ def main():
     for i, (mm, conv, const, (n, k)) in enumerate(targets):
         # whatever fed the MatMul before, the replacement has to keep that type
         orig_et = mm.input_value(1).get_element_type()
-        w = const.get_data().astype(np.float32)
+        w = to_f32(const)
         codes, scale = ternary_quantize(w)
         total_in += w.size * 2
         del w

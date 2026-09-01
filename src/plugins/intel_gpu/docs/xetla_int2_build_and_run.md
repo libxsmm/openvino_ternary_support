@@ -11,11 +11,11 @@ See [xetla_int2_architecture.md](xetla_int2_architecture.md) for how it works.
 
 | Component | Notes |
 |---|---|
-| GPU | Intel discrete GPU, Xe2 class |
+| GPU | Intel Xe2 GPU, discrete (Arc Pro B70) or integrated (Lunar Lake) |
 | GPU runtime | Intel compute runtime (`intel_gpu_vars.sh` or distro packages) |
 | Compiler | Intel oneAPI DPC++ (`icx` / `icpx`), 2026.0 or newer |
 | Build tools | CMake >= 3.16, Ninja |
-| Python | 3.10+ with `openvino` (model preparation only) |
+| Python | 3.10+ with `openvino` and `numpy` (model preparation only) |
 
 The GPU plugin builds its SYCL context from its OpenCL context
 (`sycl::make_context<backend::opencl>`), so the OpenCL backend must remain
@@ -203,15 +203,54 @@ the photosynthesis chat prompt matched the B70 OpenCL XeTLA result exactly.
 
 The implementation consumes ternary weights expressed as OpenVINO `u2` codes
 `{0,1,2}` with a scalar zero point of 1 and per-group fp16 scales (group size
-128). Convert an existing fp16 IR whose weights are already ternary:
+128).
+
+### 5.1 Export an fp16 IR
 
 ```bash
-python src/plugins/intel_gpu/tools/xetla_int2/quantize_ir_ternary.py \
-  --in  <model-fp16>/openvino_model.xml \
-  --out <model-u2>/openvino_model.xml
+python -m venv venv && ./venv/bin/pip install openvino numpy
+
+# Exporting from a checkpoint additionally needs optimum-intel. The 27B is a
+# VLM, so it exports as several models and needs the image-text-to-text task;
+# transformers 5.2.0 is the version its modelling code matches.
+./venv/bin/pip install "optimum-intel[openvino]==2.1.0" "transformers==5.2.0"
+
+./venv/bin/optimum-cli export openvino --model <8B-checkpoint>  \
+    --task text-generation-with-past --weight-format fp16 bonsai8b-fp16
+./venv/bin/optimum-cli export openvino --model <27B-checkpoint> \
+    --task image-text-to-text --weight-format fp16 bonsai27b-fp16
+```
+
+The 8B export is a single `openvino_model.xml`. The 27B export produces
+`openvino_language_model.xml` (the decoder, which is what gets quantized) plus
+`openvino_text_embeddings_model.xml`, which the 27B benchmarks need as a
+separate argument.
+
+### 5.2 Quantize to ternary u2
+
+```bash
+./venv/bin/python src/plugins/intel_gpu/tools/xetla_int2/quantize_ir_ternary.py \
+  --in  bonsai8b-fp16/openvino_model.xml \
+  --out bonsai8b-u2/openvino_model.xml
+
+./venv/bin/python src/plugins/intel_gpu/tools/xetla_int2/quantize_ir_ternary.py \
+  --in  bonsai27b-fp16/openvino_language_model.xml \
+  --out bonsai27b-u2/openvino_model.xml
 ```
 
 `--min-k` (default 1024) skips MatMuls too small to be worth compressing.
+
+Expected output, and a useful check that the weights were read correctly:
+
+| Model | MatMuls rewritten | Weights |
+|---|---|---|
+| 8B | 253 | 14.09 GiB -> 1.87 GiB |
+| 27B | 497 | 47.72 GiB -> 6.34 GiB |
+
+A checkpoint exported as bf16 needs no special handling here: the tool decodes
+bf16 constants explicitly. Reading them as fp16 instead leaves the ternary codes
+intact but corrupts every group scale, which is silent -- the model still loads
+and still generates fluent text.
 
 ---
 
@@ -227,17 +266,66 @@ OV_XETLA_INT2_DEBUG=1 <your-app> 2>&1 | grep "xetla-int2"
 Accepted nodes are logged as `accepted <node id>`, and nodes that fall back
 report the reason.
 
-### Benchmark tool
+### Benchmark tools
 
-`src/plugins/intel_gpu/tools/xetla_int2` contains a small greedy-decode
-benchmark. It is not built by the main build; build it against the OpenVINO
-build tree:
+`src/plugins/intel_gpu/tools/xetla_int2` contains greedy-decode benchmarks. They
+are not built by the main build; build them against the OpenVINO build tree:
 
 ```bash
 cd $OV_ROOT/src/plugins/intel_gpu/tools/xetla_int2
 cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DOpenVINO_DIR=$OV_ROOT/build-sycl
 cmake --build build
 ```
+
+| Tool | Model | Attention path |
+|---|---|---|
+| `bench_llm` | 8B | stateful, indirect SDPA |
+| `paged_bench_llm` | 8B | `SDPAToPagedAttention` |
+| `bench_llm_27b` | 27B | stateful, indirect SDPA |
+| `paged_bench_llm_27b` | 27B | `SDPAToPagedAttention` |
+
+The 8B tools take one model. The 27B is a VLM decoder, so its tools take the
+quantized decoder *and* the text-embeddings model, and consume rank-3 mrope
+position ids:
+
+```
+bench_llm            <model.xml> <device> [max_new_tokens] [input ids]
+paged_bench_llm      <model.xml> <device> [max_new_tokens] [input ids]
+bench_llm_27b        <decoder.xml> <embeddings.xml> <device> [max_new_tokens] [input ids]
+paged_bench_llm_27b  <decoder.xml> <embeddings.xml> <device> [max_new_tokens] [input ids]
+```
+
+`run_bonsai.sh <models-dir> [tokens]` runs all three reference configurations:
+
+```bash
+./run_bonsai.sh <models-dir> 256
+```
+
+The token ids of the chat prompt used for every number below are in
+`prompt_photosynthesis_27b.txt`.
+
+Useful environment variables:
+
+| Variable | Effect |
+|---|---|
+| `BENCH_NO_EOS=1` | Generate the full token budget instead of stopping at EOS, so runs are comparable |
+| `BENCH_MAX_LEN=<n>` | Upper bound on the sequence dimension. Over-reserving starves the ESIMD scratch and the enqueue fails with `CL_OUT_OF_RESOURCES`; 512 is a good default |
+| `BENCH_STATIC_DECODE=1` | Pin the token dimension to 1 and feed the prompt one token at a time (27B tools) |
+| `BENCH_PRECISION=f16` | Inference precision hint |
+
+### Measured results
+
+256 tokens, `BENCH_NO_EOS=1`, OpenCL runtime, all six runs token-identical:
+
+| Configuration | B70 | Lunar Lake |
+|---|---|---|
+| 8B, paged | 147.4 tok/s | 36.3 tok/s |
+| 27B, paged | 45.0 tok/s | 7.4 tok/s |
+| 27B, stateful + static decode | 41.3 tok/s | 6.6 tok/s |
+
+On B70 the paged path is reliably ahead for both models. On Lunar Lake the two
+27B paths are within run-to-run variance of each other, so neither is a
+recommended default there.
 
 ```
 bench_llm <model.xml> <device> [max_new_tokens] [comma-separated input ids]
@@ -257,7 +345,11 @@ generated_ids  =...
 
 The first run after a build compiles the kernels, so its reported prefill time
 includes JIT and can be an order of magnitude higher than later runs. Re-run
-once to get a representative number.
+once to get a representative number, or keep a persistent cache:
+
+```bash
+export SYCL_CACHE_PERSISTENT=1 SYCL_CACHE_DIR=/tmp/syclcache_bonsai
+```
 
 To compare against the stock path, set `OV_XETLA_INT2_DISABLE=1` and re-run.
 
