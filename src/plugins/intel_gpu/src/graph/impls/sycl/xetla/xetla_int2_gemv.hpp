@@ -21,16 +21,19 @@ constexpr size_t kPackFactor = 16;
 
 // `slot` identifies the caller so each FullyConnected gets private k-slicing
 // scratch; OpenVINO's queue is out-of-order and independent GEMMs overlap.
-// `postop` selects the fused epilogue: 0 none, 1 silu*other, 2 +other.
+// `postop` selects the fused epilogue: 0 none, 1 silu*other, 2 +other,
+// 3 +bias, 4 sigmoid.
 sycl::event gemv_f16(sycl::queue& q, size_t M, size_t N, size_t K,
                      void* A, void* B, void* C, void* ScaleB, size_t slot = 0,
-                     int postop = 0, void* other = nullptr, bool out_f32 = false);
+                     int postop = 0, void* other = nullptr, bool out_f32 = false,
+                     void* bias = nullptr, size_t bias_n = 0);
 
 // Experimental native ZE entry point used to validate direct command-list
 // launch of the named up-convert kernel.
 bool gemv_f16_ze_probe(void* list, void* context, void* device, size_t M, size_t N, size_t K,
                        void* A, void* B, void* C, void* ScaleB, size_t slot = 0,
-                       int postop = 0, void* other = nullptr, bool out_f32 = false);
+                       int postop = 0, void* other = nullptr, bool out_f32 = false,
+                       void* bias = nullptr, size_t bias_n = 0);
 
 // Same operands, but quantizes the activations to int8 and uses the int2 x int8
 // DPAS instead of up-converting the weights to fp16. Twice the compute peak, at

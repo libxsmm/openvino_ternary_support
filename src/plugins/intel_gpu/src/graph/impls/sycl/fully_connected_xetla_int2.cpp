@@ -268,11 +268,15 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         void* gemm_out = staging ? staging->buffer_ptr() : out_ptr;
         // Post-ops are replayed in graph order: SiLU then the binary eltwise.
         bool fuse_silu = false;
+        bool fuse_sigmoid = false;
         const ::sycl::half* elt_other = nullptr;
         bool elt_is_prod = false;
         for (const auto& f : params->fused_desc) {
-            if (std::dynamic_pointer_cast<const activation>(f.desc)) {
-                fuse_silu = true;
+            if (const auto a = std::dynamic_pointer_cast<const activation>(f.desc)) {
+                if (a->activation_function == activation_func::logistic)
+                    fuse_sigmoid = true;
+                else
+                    fuse_silu = true;
             } else if (const auto e = std::dynamic_pointer_cast<const eltwise>(f.desc)) {
                 elt_other =
                     static_cast<const ::sycl::half*>(instance.dep_memory_ptr(f.outer_dep_start_idx)->buffer_ptr());
@@ -285,16 +289,26 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         // kernel supports the fused epilogue too, but its large tiles make it
         // measurably slower than the separate pass, so it is opt-in there.
         static const bool dpas_fold = std::getenv("OV_XETLA_INT2_DPAS_FOLD") != nullptr;
+        const bool has_bias = instance.bias_term();
         int postop = 0;
         if (elt_other != nullptr && (!use_dpas || dpas_fold)) {
             if (fuse_silu && elt_is_prod)
                 postop = 1;
             else if (!fuse_silu && !elt_is_prod)
                 postop = 2;
+        } else if (elt_other == nullptr && !use_dpas) {
+            // GatedDeltaNet gates: in_proj_b is a bare sigmoid, in_proj_a a bare bias.
+            const int fold_gates = xetla_int2_fold_gates();
+            if ((fold_gates & 2) && fuse_sigmoid && !fuse_silu)
+                postop = 4;
+            else if ((fold_gates & 1) && !fuse_sigmoid && !fuse_silu && has_bias)
+                postop = 3;
         }
+        void* postop_bias = postop == 3 ? instance.bias_memory()->buffer_ptr() : nullptr;
         void* postop_other = postop != 0 ? const_cast<::sycl::half*>(elt_other) : nullptr;
         if (postop != 0) {
             fuse_silu = false;
+            fuse_sigmoid = false;
             elt_other = nullptr;
         }
 
@@ -302,25 +316,29 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
     if (std::getenv("OV_XETLA_INT2_ZE_DIRECT") != nullptr ||
         std::getenv("OV_XETLA_INT2_ZE_DIRECT_QKV") != nullptr) {
             auto& ze_stream = downcast<ze::ze_stream>(stream);
+            // A shape or post-op the direct table does not cover falls through
+            // to the SYCL submission below rather than failing the inference.
             const bool ok = ov::intel_gpu::xetla_int2::gemv_f16_ze_probe(
                 ze_stream.get_queue(), ze_stream.get_engine().get_context().handle(),
                 ze_stream.get_engine().get_device().handle(), M, n_pad, _K,
                 instance.input_memory_ptr(0)->buffer_ptr(), packed_weights->buffer_ptr(),
-                gemm_out, scales->buffer_ptr(), _slot, postop, postop_other, native_f32);
-            OPENVINO_ASSERT(ok, "[GPU] xetla int2: direct ZE launch failed");
-            if (staging) {
-                const size_t element_size = native_f32 ? sizeof(float) : sizeof(::sycl::half);
-                const size_t row_bytes = _N * element_size;
-                const size_t padded_row_bytes = n_pad * element_size;
-                auto* src = static_cast<const char*>(gemm_out);
-                auto* dst = static_cast<char*>(out_ptr);
-                for (size_t row = 0; row < M; ++row) {
-                    OV_ZE_EXPECT(ze::zeCommandListAppendMemoryCopy(
-                        ze_stream.get_queue(), dst + row * row_bytes, src + row * padded_row_bytes,
-                        row_bytes, nullptr, 0, nullptr));
+                gemm_out, scales->buffer_ptr(), _slot, postop, postop_other, native_f32,
+                postop_bias, _N);
+            if (ok) {
+                if (staging) {
+                    const size_t element_size = native_f32 ? sizeof(float) : sizeof(::sycl::half);
+                    const size_t row_bytes = _N * element_size;
+                    const size_t padded_row_bytes = n_pad * element_size;
+                    auto* src = static_cast<const char*>(gemm_out);
+                    auto* dst = static_cast<char*>(out_ptr);
+                    for (size_t row = 0; row < M; ++row) {
+                        OV_ZE_EXPECT(ze::zeCommandListAppendMemoryCopy(
+                            ze_stream.get_queue(), dst + row * row_bytes, src + row * padded_row_bytes,
+                            row_bytes, nullptr, 0, nullptr));
+                    }
                 }
+                return nullptr;
             }
-            return nullptr;
         }
 #endif
 
@@ -343,7 +361,8 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
                                                            packed_weights->buffer_ptr(),
                                                            gemm_out,
                                                            scales->buffer_ptr(),
-                                                           _slot, postop, postop_other, native_f32);
+                                                           _slot, postop, postop_other, native_f32,
+                                                           postop_bias, _N);
 
         if (staging) {
             const size_t n = _N;
@@ -377,13 +396,15 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
                     dst[idx] = static_cast<::sycl::half>(v);
                 });
             }
-        } else if (fuse_silu || elt_other) {
+        } else if (fuse_silu || fuse_sigmoid || elt_other) {
             auto* dst = static_cast<::sycl::half*>(out_ptr);
             ev = sycl_queue.parallel_for(::sycl::range<1>(M * _N), ev, [=](::sycl::id<1> i) {
                 const size_t idx = i[0];
                 float v = static_cast<float>(dst[idx]);
                 if (fuse_silu)
                     v = v / (1.0f + ::sycl::exp(-v));
+                if (fuse_sigmoid)
+                    v = 1.0f / (1.0f + ::sycl::exp(-v));
                 if (elt_other) {
                     const float o = static_cast<float>(elt_other[idx]);
                     v = elt_is_prod ? v * o : v + o;
@@ -416,12 +437,16 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         const size_t K = wei_shape[1];
 
         const auto& desc = arg.get_primitive();
+        // Dependencies are input, weights, [bias], [scale], [zero point], so a
+        // bias shifts the decompression operands one slot along.
+        const size_t scale_dep_idx = desc->bias.is_valid() ? 3 : 2;
+        const size_t zp_dep_idx = scale_dep_idx + 1;
         // OpenVINO has no i2, so ternary arrives as u2 codes offset by a zero point.
         int32_t zp = 0;
         if (desc->decompression_zero_point_scalar.has_value()) {
             zp = static_cast<int32_t>(std::lround(desc->decompression_zero_point_scalar.value()));
         } else if (desc->decompression_zero_point.is_valid()) {
-            const auto* zp_node = const_source(&arg.get_dependency(3));
+            const auto* zp_node = const_source(&arg.get_dependency(zp_dep_idx));
             OPENVINO_ASSERT(zp_node != nullptr, "[GPU] xetla int2: zero point is not constant");
             zp = static_cast<int32_t>(std::lround(read_scalar(zp_node->as<data>().get_attached_memory_ptr(), stream)));
         }
@@ -459,7 +484,7 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         // output channel, i.e. [N, K/group_size].
         const size_t groups = K / kGroupSize;
         bool scales_via_reorder = false;
-        const auto* scale_node = const_source(&arg.get_dependency(2), &scales_via_reorder);
+        const auto* scale_node = const_source(&arg.get_dependency(scale_dep_idx), &scales_via_reorder);
         OPENVINO_ASSERT(scale_node != nullptr, "[GPU] xetla int2: decompression scale is not constant");
         auto scale_mem = scale_node->as<data>().get_attached_memory_ptr();
         OPENVINO_ASSERT(scale_mem->get_layout().data_type == data_types::f16,

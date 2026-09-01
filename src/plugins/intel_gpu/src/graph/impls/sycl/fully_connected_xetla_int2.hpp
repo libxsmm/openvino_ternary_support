@@ -19,6 +19,25 @@
 namespace cldnn {
 namespace sycl {
 
+// OV_XETLA_INT2_FOLD_GATES=bias|sigmoid|none|1 selects which GatedDeltaNet gate
+// epilogues are folded; bit 0 is the bias, bit 1 the sigmoid.
+inline int xetla_int2_fold_gates() {
+    static const int v = [] {
+        const char* e = std::getenv("OV_XETLA_INT2_FOLD_GATES");
+        if (e == nullptr)
+            return 3;
+        const std::string s(e);
+        if (s == "none" || s == "0")
+            return 0;
+        if (s == "bias")
+            return 1;
+        if (s == "sigmoid")
+            return 2;
+        return 3;
+    }();
+    return v;
+}
+
 // Weight-only-quantized FullyConnected on 2-bit weights, executed by the XeTLA
 // int2 GEMV. OpenVINO has no signed 2-bit type, so ternary weights arrive as u2
 // codes {0,1,2} plus a zero point of 1; the codes are re-encoded to the
@@ -46,14 +65,29 @@ struct XetlaInt2FCImplementationManager : public ImplementationManager {
 
         if (!fc_prim->compressed_weights)
             XETLA_REJECT("not compressed_weights");
-        // The kernel folds no bias and no post-ops.
-        if (fc_prim->bias.is_valid())
-            XETLA_REJECT("bias");
-        // Only a trailing SiLU is folded; anything else still goes to the OCL path.
+        const int fold_gates = xetla_int2_fold_gates();
+        // A constant bias folds into the epilogue, but only on the up-convert
+        // path and only when nothing else is fused after it.
+        if (fc_prim->bias.is_valid()) {
+            if ((fold_gates & 1) == 0)
+                XETLA_REJECT("bias");
+            if (!fc_node.bias().is_type<data>())
+                XETLA_REJECT("bias is not a constant");
+            if (!fc_node.get_fused_primitives().empty())
+                XETLA_REJECT("bias combined with fused post-ops");
+            if (ov::intel_gpu::xetla_int2::variant_from_env() !=
+                ov::intel_gpu::xetla_int2::Variant::upcvt_fp16)
+                XETLA_REJECT("bias needs the up-convert epilogue");
+        }
+        // Only a trailing SiLU or sigmoid is folded; anything else still goes
+        // to the OCL path.
         for (const auto& f : fc_node.get_fused_primitives()) {
             const auto act = std::dynamic_pointer_cast<const activation>(f.desc);
             const auto elt = std::dynamic_pointer_cast<const eltwise>(f.desc);
-            const bool ok_act = act && act->activation_function == activation_func::swish && f.total_num_deps == 1;
+            const bool ok_act = act && f.total_num_deps == 1 &&
+                                (act->activation_function == activation_func::swish ||
+                                 ((fold_gates & 2) &&
+                                  act->activation_function == activation_func::logistic));
             const bool ok_elt = elt && f.total_num_deps == 2 &&
                                 (elt->mode == eltwise_mode::sum || elt->mode == eltwise_mode::prod) &&
                                 f.has_outer_dep() &&

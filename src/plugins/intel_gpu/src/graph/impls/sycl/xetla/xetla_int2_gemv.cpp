@@ -37,6 +37,32 @@ namespace {
 // Fixed K-group for the fp16-scales upcvt kernel (matches the xetla test).
 static constexpr int kScaleGS = 128;
 
+// XeTLA's own sigmoid_op_t predates chained_tile_op_t and takes no arguments_t,
+// so it cannot be chained. This mirrors silu_op_t without the final multiply.
+struct sigmoid_chain_op_t {
+  struct arguments_t {};
+  template <typename matAcc_t, typename coord_t>
+  __XETLA_API KERNEL_FUNC void operator()(
+      matAcc_t& matAcc, [[maybe_unused]] const coord_t& coord,
+      [[maybe_unused]] const arguments_t& args,
+      [[maybe_unused]] uint32_t slm_base = 0,
+      [[maybe_unused]] uint32_t nbarrier_base = 0) {
+    constexpr int elems = matAcc_t::tile_desc::block_elems;
+    constexpr int rounds = matAcc_t::tile_desc::tile_elems / elems;
+#pragma unroll
+    for (int i = 0; i < rounds; ++i) {
+      auto sub_vec = matAcc.reg.xetla_select<elems, 1>(elems * i);
+      sub_vec = xetla_sigmoid<typename matAcc_t::dtype, elems>(sub_vec);
+    }
+    constexpr int remaining_elems = matAcc_t::tile_desc::tile_elems % elems;
+    if constexpr (remaining_elems != 0) {
+      auto sub_vec = matAcc.reg.xetla_select<remaining_elems, 1>(
+          elems * (matAcc_t::tile_elems / elems));
+      sub_vec = xetla_sigmoid<typename matAcc_t::dtype, remaining_elems>(sub_vec);
+    }
+  }
+};
+
 // Unique kernel-name tag to avoid mangled-name collisions between
 // (XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned) instantiations.
 template <
@@ -53,7 +79,8 @@ template <
 sycl::event int2_upcvt_gemm_impl(
     sycl::queue& queue, const size_t M, const size_t N, const size_t K,
     XT* A_d, int32_t* B_d, CT* C_d, XT* ScaleB_d,
-    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr) {
+    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr, CT* Bias_d = nullptr,
+    size_t BiasN = 0) {
   using data_type_a = XT;
   using data_type_b = int2x16;
   using data_type_c = CT;
@@ -92,13 +119,21 @@ sycl::event int2_upcvt_gemm_impl(
       compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
 
   using silu_t = gpu::xetla::subgroup::silu_op_t;
+  using sigmoid_t = sigmoid_chain_op_t;
+  using bias_t = gpu::xetla::subgroup::bias_add_op_t<CT, arch_tag>;
   using prod_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
       gpu::xetla::reduce_op::prod, XT, arch_tag>;
   using sum_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
       gpu::xetla::reduce_op::sum, XT, arch_tag>;
+  // 3 and 4 cover the GatedDeltaNet gates: in_proj_a carries a bias, in_proj_b
+  // a fused sigmoid.
   using tile_op_t = std::conditional_t<
       POSTOP == 1, gpu::xetla::subgroup::chained_tile_op_t<silu_t, prod_t>,
-      gpu::xetla::subgroup::chained_tile_op_t<sum_t>>;
+      std::conditional_t<
+          POSTOP == 2, gpu::xetla::subgroup::chained_tile_op_t<sum_t>,
+          std::conditional_t<
+              POSTOP == 3, gpu::xetla::subgroup::chained_tile_op_t<bias_t>,
+              gpu::xetla::subgroup::chained_tile_op_t<sigmoid_t>>>>;
 
   // Post-ops need the aligned epilogue; N is padded to a multiple of 4 at pack
   // time so that always holds when POSTOP != 0.
@@ -134,13 +169,20 @@ sycl::event int2_upcvt_gemm_impl(
           static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int2x16*>(B_d),
           ldb, C_d, ldc, ScaleB_d, lds, Acc_d, Cnt_d);
     } else {
-      using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
-      typename reduce_t::arguments_t other_args(
-          Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M),
-                    static_cast<uint32_t>(N)});
       typename tile_op_t::arguments_t tile_args;
-      // silu occupies slot 0 when present, so the reduce op shifts to slot 1.
-      tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      if constexpr (POSTOP == 1 || POSTOP == 2) {
+        using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
+        typename reduce_t::arguments_t other_args(
+            Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M),
+                      static_cast<uint32_t>(N)});
+        // silu occupies slot 0 when present, so the reduce op shifts to slot 1.
+        tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      } else if constexpr (POSTOP == 3) {
+        // Bound by the real N so lanes in the padded tail read as masked-off.
+        const uint32_t bn = static_cast<uint32_t>(BiasN != 0 ? BiasN : N);
+        typename bias_t::arguments_t bias_args(Bias_d, {bn, 1, bn});
+        tile_args.template set<0>(bias_args);
+      }
       typename epilogue_t::arguments_t epilogue_args(tile_args);
       return typename gemm_op_t::arguments_t(
           static_cast<uint32_t>(M), static_cast<uint32_t>(K),
@@ -178,7 +220,8 @@ bool int2_upcvt_gemm_ze_probe(
   ze_command_list_handle_t list, const sycl::context& context, const sycl::device& device,
   const size_t M, const size_t N, const size_t K,
     XT* A_d, int32_t* B_d, CT* C_d, XT* ScaleB_d,
-    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr) {
+    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr, CT* Bias_d = nullptr,
+    size_t BiasN = 0) {
   using data_type_a = XT;
   using data_type_b = int2x16;
   using data_type_c = CT;
@@ -195,13 +238,19 @@ bool int2_upcvt_gemm_ze_probe(
       compute_attr, perf_tuning_knob, data_type_scale, kScaleGS, SGM, arch_tag, kUnaligned>;
   using gemm_t = gpu::xetla::group::gemm_t<compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
     using silu_t = gpu::xetla::subgroup::silu_op_t;
+    using sigmoid_t = sigmoid_chain_op_t;
+    using bias_t = gpu::xetla::subgroup::bias_add_op_t<CT, arch_tag>;
     using prod_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
       gpu::xetla::reduce_op::prod, XT, arch_tag>;
     using sum_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
       gpu::xetla::reduce_op::sum, XT, arch_tag>;
     using tile_op_t = std::conditional_t<
       POSTOP == 1, gpu::xetla::subgroup::chained_tile_op_t<silu_t, prod_t>,
-      gpu::xetla::subgroup::chained_tile_op_t<sum_t>>;
+      std::conditional_t<
+        POSTOP == 2, gpu::xetla::subgroup::chained_tile_op_t<sum_t>,
+        std::conditional_t<
+          POSTOP == 3, gpu::xetla::subgroup::chained_tile_op_t<bias_t>,
+          gpu::xetla::subgroup::chained_tile_op_t<sigmoid_t>>>>;
     using epilogue_policy_t = std::conditional_t<
       POSTOP != 0, gpu::xetla::group::epilogue_policy_tile_op<tile_op_t, arch_tag>,
       std::conditional_t<
@@ -224,11 +273,17 @@ bool int2_upcvt_gemm_ze_probe(
         A_d, static_cast<uint32_t>(K), reinterpret_cast<int2x16*>(B_d), static_cast<uint32_t>(N),
         C_d, static_cast<uint32_t>(N), ScaleB_d, static_cast<uint32_t>(N), Acc_d, Cnt_d);
     } else {
-      using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
-      typename reduce_t::arguments_t other_args(
-        Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M), static_cast<uint32_t>(N)});
       typename tile_op_t::arguments_t tile_args;
-      tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      if constexpr (POSTOP == 1 || POSTOP == 2) {
+        using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
+        typename reduce_t::arguments_t other_args(
+          Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M), static_cast<uint32_t>(N)});
+        tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      } else if constexpr (POSTOP == 3) {
+        const uint32_t bn = static_cast<uint32_t>(BiasN != 0 ? BiasN : N);
+        typename bias_t::arguments_t bias_args(Bias_d, {bn, 1, bn});
+        tile_args.template set<0>(bias_args);
+      }
       typename epilogue_t::arguments_t epilogue_args(tile_args);
       return typename gemm_op_t::arguments_t(
         static_cast<uint32_t>(M), static_cast<uint32_t>(K), static_cast<uint32_t>(N),
@@ -333,9 +388,10 @@ template <
     bool kUnaligned, typename CT = XT, int POSTOP = 0>
 sycl::event upcvt_dispatch(
     sycl::queue& q, size_t M, size_t N, size_t K, XT* A, int32_t* B,
-    CT* C, XT* SB, float* acc, uint32_t* cnt, XT* other = nullptr) {
+    CT* C, XT* SB, float* acc, uint32_t* cnt, XT* other = nullptr,
+    CT* bias = nullptr, size_t bias_n = 0) {
   return int2_upcvt_gemm_impl<XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned, CT, POSTOP>(
-      q, M, N, K, A, B, C, SB, acc, cnt, other);
+      q, M, N, K, A, B, C, SB, acc, cnt, other, bias, bias_n);
 }
 
 // Compute scratch byte requirements for a given (M, N, KS, LS) by
@@ -446,14 +502,16 @@ bool int2_upcvt_gemm_ze_run(ze_command_list_handle_t list,
                             int32_t* B,
                             CT* C,
                             XT* ScaleB,
-                            XT* Other = nullptr) {
+                            XT* Other = nullptr,
+                            CT* Bias = nullptr,
+                            size_t BiasN = 0) {
   const auto need = upcvt_scratch_bytes<XT, 1, WGN, 1, 16, 128, KS, LS, false>(M, N);
   float* acc = nullptr;
   uint32_t* cnt = nullptr;
   if (!get_direct_ze_scratch(list, ze_context, ze_device, need.first, need.second, acc, cnt))
     return false;
   return int2_upcvt_gemm_ze_probe<XT, 1, WGN, 1, 16, 128, KS, LS, false, CT, POSTOP>(
-      list, context, device, M, N, K, A, B, C, ScaleB, acc, cnt, Other);
+      list, context, device, M, N, K, A, B, C, ScaleB, acc, cnt, Other, Bias, BiasN);
 }
 #endif
 
@@ -474,7 +532,8 @@ bool is_integrated_gpu(const sycl::device& device) {
 template <typename XT, typename CT = XT, int POSTOP = 0>
 sycl::event int2_upcvt_gemm_run(
     sycl::queue& q, const size_t M, const size_t N, const size_t K,
-    XT* A, int32_t* B, CT* C, XT* ScaleB, const size_t slot, XT* Other = nullptr) {
+    XT* A, int32_t* B, CT* C, XT* ScaleB, const size_t slot, XT* Other = nullptr,
+    CT* Bias = nullptr, size_t BiasN = 0) {
   const bool aligned_n = (N % 4 == 0);
 
   // Bound the scratch by the tiers this M can actually reach. Prefill only ever
@@ -504,21 +563,32 @@ sycl::event int2_upcvt_gemm_run(
   // Dispatch table. We instantiate one compiled kernel per (KS, LS, kUnaligned)
   // triple that we want to use; tile shape is fixed at WGM=1/SGM=1/SGN=16/SGK=128
   // and WGN tracked separately.
+// Prefill wants the XMX GEMM tile, not the GEMV one: XeTLA's own harness only
+// uses the GEMV shape at M==1 and switches to sg_m=8/sg_n=128 above that.
+#define DISPATCH_GEMM(WGM_, SGM_, WGN_, SGN_, SGK_)                           \
+  do {                                                                        \
+    if (aligned_n)                                                            \
+      return upcvt_dispatch<XT, WGM_, WGN_, SGM_, SGN_, SGK_, 1, 1,           \
+                            /*kUnaligned*/ false, CT, POSTOP>(                \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other, Bias, BiasN);   \
+    else                                                                      \
+      return upcvt_dispatch<XT, WGM_, WGN_, SGM_, SGN_, SGK_, 1, 1,           \
+                            /*kUnaligned*/ true, CT, POSTOP>(                 \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other, Bias, BiasN);   \
+  } while (0)
+
 #define DISPATCH_RAW(WGN_, KS_, LS_)                                          \
   do {                                                                        \
-    if (std::getenv("XETLA_INT2_CFG_DEBUG"))                                  \
-      fprintf(stderr, "[xetla] cfg N=%zu K=%zu M=%zu -> WGN=%d KS=%d LS=%d\n", \
-              N, K, M, WGN_, KS_, LS_);                                       \
     if (aligned_n)                                                            \
       return upcvt_dispatch<                                                  \
           XT, /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,  \
           /*kUnaligned*/ false, CT, POSTOP>(q, M, N, K, A, B, C, ScaleB,      \
-                                            sc.acc, sc.cnt, Other);           \
+                                            sc.acc, sc.cnt, Other, Bias, BiasN); \
     else                                                                      \
       return upcvt_dispatch<                                                  \
           XT, /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,  \
           /*kUnaligned*/ true, CT, POSTOP>(q, M, N, K, A, B, C, ScaleB,       \
-                                           sc.acc, sc.cnt, Other);            \
+                                           sc.acc, sc.cnt, Other, Bias, BiasN);  \
   } while (0)
 
 // K is split KS ways globally and LS ways locally, each slice consuming whole
@@ -621,8 +691,15 @@ sycl::event int2_upcvt_gemm_run(
       DISPATCH(128, 1, 1);
     }
   }
-  // M>1 fallback (works correctly; not perf-tuned for prefill).
-  DISPATCH(128, 1, 1);
+  // M>1 prefill. The GEMV tile stays ahead for chat-length prompts (M=21:
+  // 0.41 s) but scales at ~17 ms/token, while the XMX GEMM tile costs
+  // ~7.5 ms/token and takes over around M~100 (M=1024: 7.7 s vs 17.6 s).
+  // n_pad is a multiple of 16, not always of the 128-wide wg tile.
+  if (M >= 128 && N % 128 == 0) {
+    DISPATCH_GEMM(32, 8, 128, 128, 32);
+  }
+  DISPATCH_RAW(128, 1, 1);
+#undef DISPATCH_GEMM
 #undef DISPATCH
 #undef DISPATCH_RAW
 #undef K_DIVIDES
@@ -666,22 +743,38 @@ Variant variant_from_env() {
 
 sycl::event gemv_f16(sycl::queue& q, size_t M, size_t N, size_t K,
                      void* A, void* B, void* C, void* ScaleB, size_t slot,
-                     int postop, void* other, bool out_f32) {
+                     int postop, void* other, bool out_f32, void* bias,
+                     size_t bias_n) {
   using fp16 = gpu::xetla::fp16;
   auto* a = static_cast<fp16*>(A);
   auto* b = static_cast<int32_t*>(B);
   auto* s = static_cast<fp16*>(ScaleB);
   auto* o = static_cast<fp16*>(other);
   if (out_f32) {
-    // lm_head only: f32 logits straight out of the fp32 accumulator.
-    return int2_upcvt_gemm_run<fp16, float, 0>(q, M, N, K, a, b, static_cast<float*>(C), s, slot, o);
+    // lm_head and the f32 GatedDeltaNet gates: f32 straight out of the
+    // fp32 accumulator, so the bias is f32 too.
+    auto* cf = static_cast<float*>(C);
+    auto* bf = static_cast<float*>(bias);
+    switch (postop) {
+      case 3:
+        return int2_upcvt_gemm_run<fp16, float, 3>(q, M, N, K, a, b, cf, s, slot, nullptr, bf, bias_n);
+      case 4:
+        return int2_upcvt_gemm_run<fp16, float, 4>(q, M, N, K, a, b, cf, s, slot, nullptr, nullptr, 0);
+      default:
+        return int2_upcvt_gemm_run<fp16, float, 0>(q, M, N, K, a, b, cf, s, slot, o);
+    }
   }
   auto* c = static_cast<fp16*>(C);
+  auto* bi = static_cast<fp16*>(bias);
   switch (postop) {
     case 1:
       return int2_upcvt_gemm_run<fp16, fp16, 1>(q, M, N, K, a, b, c, s, slot, o);
     case 2:
       return int2_upcvt_gemm_run<fp16, fp16, 2>(q, M, N, K, a, b, c, s, slot, o);
+    case 3:
+      return int2_upcvt_gemm_run<fp16, fp16, 3>(q, M, N, K, a, b, c, s, slot, o, bi, bias_n);
+    case 4:
+      return int2_upcvt_gemm_run<fp16, fp16, 4>(q, M, N, K, a, b, c, s, slot, o);
     default:
       return int2_upcvt_gemm_run<fp16, fp16, 0>(q, M, N, K, a, b, c, s, slot, o);
   }
@@ -690,7 +783,8 @@ sycl::event gemv_f16(sycl::queue& q, size_t M, size_t N, size_t K,
 bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
                        size_t M, size_t N, size_t K,
                        void* A, void* B, void* C, void* ScaleB, size_t,
-                       int postop, void* other, bool out_f32) {
+                       int postop, void* other, bool out_f32, void* bias,
+                       size_t bias_n) {
 #ifdef OV_GPU_WITH_ZE_RT
   using fp16 = gpu::xetla::fp16;
   static std::mutex context_mutex;
@@ -714,11 +808,14 @@ bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
       static_cast<ze_command_list_handle_t>(list), ze_context, ze_device,                  \
       *cached_context, *cached_device, M, N, K,                                             \
       static_cast<fp16*>(A), static_cast<int32_t*>(B), static_cast<CT_*>(C),               \
-      static_cast<fp16*>(ScaleB), static_cast<fp16*>(other))
+      static_cast<fp16*>(ScaleB), static_cast<fp16*>(other),                              \
+      static_cast<CT_*>(bias), bias_n)
 #define DIRECT_F16(WGN_, KS_, LS_)                                                          \
   switch (postop) {                                                                         \
     case 1: DIRECT_RUN(WGN_, KS_, LS_, fp16, 1);                                            \
     case 2: DIRECT_RUN(WGN_, KS_, LS_, fp16, 2);                                            \
+    case 3: DIRECT_RUN(WGN_, KS_, LS_, fp16, 3);                                            \
+    case 4: DIRECT_RUN(WGN_, KS_, LS_, fp16, 4);                                            \
     default: DIRECT_RUN(WGN_, KS_, LS_, fp16, 0);                                           \
   }
 
@@ -730,7 +827,10 @@ bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
         DIRECT_RUN(32, 1, 4, float, 0);
       }
     }
-    return false;
+    // Any other f32-out lm_head, e.g. the 27B's K=5120 N=248320.
+    if (M > 1)
+      DIRECT_RUN(128, 1, 1, float, 0);
+    DIRECT_RUN(32, 1, 4, float, 0);
   }
 
   if (M > 1)
@@ -761,6 +861,16 @@ bool gemv_f16_ze_probe(void* list, void* context_handle, void* device_handle,
       DIRECT_F16(32, 1, 8);
     }
   }
+  // Generic tiers, mirroring the SYCL dispatch so an untuned model (the 27B)
+  // still gets the direct launch instead of falling back per call.
+  if (N <= 4096) {
+    DIRECT_F16(32, 2, 4);
+  } else if (N <= 8192) {
+    DIRECT_F16(64, 1, 4);
+  } else if (N <= 16384) {
+    DIRECT_F16(64, 1, 2);
+  }
+  DIRECT_F16(128, 1, 1);
 #undef DIRECT_F16
 #undef DIRECT_RUN
   return false;
