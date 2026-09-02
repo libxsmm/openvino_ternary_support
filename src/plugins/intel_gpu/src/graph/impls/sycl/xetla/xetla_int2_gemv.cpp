@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <tuple>
@@ -36,6 +37,13 @@ namespace {
 
 // Fixed K-group for the fp16-scales upcvt kernel (matches the xetla test).
 static constexpr int kScaleGS = 128;
+
+// Reports the (K, N) -> (wg_n, ks, ls) tile actually selected, once per shape.
+// Queried on every dispatch, so the lookup is resolved once.
+inline bool xetla_int2_dispatch_debug() {
+  static const bool on = std::getenv("XETLA_INT2_DISPATCH_DEBUG") != nullptr;
+  return on;
+}
 
 // XeTLA's own sigmoid_op_t predates chained_tile_op_t and takes no arguments_t,
 // so it cannot be chained. This mirrors silu_op_t without the final multiply.
@@ -579,6 +587,15 @@ sycl::event int2_upcvt_gemm_run(
 
 #define DISPATCH_RAW(WGN_, KS_, LS_)                                          \
   do {                                                                        \
+    if (xetla_int2_dispatch_debug()) {                                         \
+      static std::mutex cfg_mutex;                                            \
+      static std::set<std::tuple<size_t, size_t, int, int, int>> cfg_seen;     \
+      std::lock_guard<std::mutex> cfg_lock(cfg_mutex);                        \
+      if (cfg_seen.emplace(K, N, WGN_, KS_, LS_).second)                      \
+        fprintf(stderr,                                                       \
+                "[xetla-int2] M=%zu K=%zu N=%zu -> wg_n=%d ks=%d ls=%d\n",    \
+                (size_t)M, (size_t)K, (size_t)N, (int)WGN_, (int)KS_, (int)LS_); \
+    }                                                                         \
     if (aligned_n)                                                            \
       return upcvt_dispatch<                                                  \
           XT, /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,  \
@@ -595,15 +612,31 @@ sycl::event int2_upcvt_gemm_run(
 // SGK=128 chunks, so K must divide evenly by KS*LS*128. It silently produced
 // NaNs otherwise (e.g. MoE down_proj with K=768 under the KS=2,LS=4 tier), so
 // step down to a slicing that divides before falling back to no slicing.
+// Descend one rung at a time: hidden sizes that are 512- but not 1024-aligned
+// (2560, 9728) otherwise skipped straight past the (1,4) tier they support.
 #define K_DIVIDES(KS_, LS_) ((K % ((KS_) * (LS_) * 128)) == 0)
 #define DISPATCH(WGN_, KS_, LS_)                                              \
   do {                                                                        \
     if (K_DIVIDES(KS_, LS_))     { DISPATCH_RAW(WGN_, KS_, LS_); }            \
+    else if (deep_k_slicing && K_DIVIDES(1, 8)) { DISPATCH_RAW(WGN_, 1, 8); } \
+    else if (deep_k_slicing && K_DIVIDES(1, 4)) { DISPATCH_RAW(WGN_, 1, 4); } \
     else if (K_DIVIDES(1, 2))    { DISPATCH_RAW(WGN_, 1, 2); }                \
     else                         { DISPATCH_RAW(WGN_, 1, 1); }                \
   } while (0)
 
+  // The intermediate rungs trade more k-slices for shorter slices, which the
+  // discrete part's bandwidth absorbs but the integrated one does not: on LNL
+  // the 4B (K=2560, 9728) loses 4% taking (1,4) instead of (1,2).
+  const bool deep_k_slicing = !is_integrated_gpu(q.get_device());
+
   if (M == 1) {
+    if (xetla_int2_dispatch_debug()) {
+      static std::mutex seen_mutex;
+      static std::set<std::pair<size_t, size_t>> seen;
+      std::lock_guard<std::mutex> lock(seen_mutex);
+      if (seen.emplace(K, N).second)
+        fprintf(stderr, "[xetla-int2] decode GEMV shape K=%zu N=%zu\n", K, N);
+    }
     // Sweep hook: the tier table below is tuned for discrete parts, whose
     // bandwidth differs enough from integrated ones that the winning tile does
     // not carry over. -1 keeps the table.
@@ -635,6 +668,18 @@ sycl::event int2_upcvt_gemm_run(
       else if (K == 4096 && N == 24576)  { DISPATCH(256, 1, 1); }
       else if (K == 12288 && N == 4096)  { DISPATCH(32, 1, 2); }
       else if (K == 4096 && N == 151680) { DISPATCH(128, 1, 2); }
+      // 1.7B
+      else if (K == 2048 && N == 4096)   { DISPATCH(32, 1, 2); }
+      else if (K == 2048 && N == 2048)   { DISPATCH(32, 1, 4); }
+      else if (K == 2048 && N == 12288)  { DISPATCH(64, 1, 2); }
+      else if (K == 6144 && N == 2048)   { DISPATCH(128, 1, 4); }
+      else if (K == 2048 && N == 151680) { DISPATCH(32, 1, 1); }
+      // 4B
+      else if (K == 2560 && N == 6144)   { DISPATCH(32, 1, 1); }
+      else if (K == 4096 && N == 2560)   { DISPATCH(64, 1, 2); }
+      else if (K == 2560 && N == 19456)  { DISPATCH(128, 1, 2); }
+      else if (K == 9728 && N == 2560)   { DISPATCH(64, 1, 2); }
+      else if (K == 2560 && N == 151680) { DISPATCH(32, 1, 1); }
     }
     // ----- Tuned GEMV shapes for a 4096-wide hidden size.
     // Format: (K, N) -> (WGN, KS, LS).
@@ -680,6 +725,18 @@ sycl::event int2_upcvt_gemm_run(
     else if (K == 6144 && N == 5120)    { DISPATCH(32, 1, 4); }
     else if (K == 5120 && N == 14336)   { DISPATCH(32, 1, 2); }
     else if (K == 5120 && N == 248320)  { DISPATCH(32, 1, 4); }
+    // ----- Tuned GEMV shapes for a 2048-wide hidden size (Bonsai 1.7B).
+    // Measured on B70 with the int2 tune harness at a >=2 GB rotating
+    // footprint; every one of these beats the generic tier below, the lm_head
+    // most (349 GiB/s on wg32 vs <263 on the generic wg128 tile).
+    // ----- Tuned GEMV shapes for the 2048-wide hidden size (Bonsai 1.7B).
+    // These are the shapes the dispatcher actually sees: q/k/v are fused to
+    // N=4096 and gate+up to N=12288, and the lm_head is padded to 151680.
+    else if (K == 2048 && N == 4096)    { DISPATCH(64, 1, 8); }
+    else if (K == 2048 && N == 2048)    { DISPATCH(32, 1, 8); }
+    else if (K == 2048 && N == 12288)   { DISPATCH(32, 1, 2); }
+    else if (K == 6144 && N == 2048)    { DISPATCH(64, 1, 8); }
+    else if (K == 2048 && N == 151680)  { DISPATCH(64, 1, 2); }
     // Generic GEMV fallback tiers (kept from upcvt test driver).
     else if (N <= 4096) {
       DISPATCH(32, 2, 4);
