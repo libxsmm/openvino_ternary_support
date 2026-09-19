@@ -366,7 +366,7 @@ token-identical, and each model produces the same tokens on both GPUs:
 | 8B | paged | 147.4 | 36.3 |
 | 27B | paged | 45.0 | 7.4 |
 | 27B | stateful + static decode | 41.3 | 6.6 |
-| Bonsai 2 27B | paged | 44.6 | |
+| Bonsai 2 27B | paged | 44.7 | 7.0-7.8 |
 | Bonsai 2 27B | stateful + static decode | 40.9 | |
 
 Paged is ahead on every model on B70. On Lunar Lake it leads clearly for 1.7B
@@ -466,18 +466,36 @@ rather than silently falling back if such an FC is rejected.
 `OV_XETLA_INT2_FUSE_HADAMARD=0` leaves the rotation in the graph;
 `OV_XETLA_HADAMARD_DEBUG=1` traces the match.
 
-### 7.3 Results (B70, 256 tokens, `BENCH_NO_EOS=1`, photosynthesis prompt)
+### 7.3 Results (256 tokens, `BENCH_NO_EOS=1`, photosynthesis prompt)
 
 | Path | Bonsai 27B | Bonsai 2 27B, rotation in graph | Bonsai 2 27B, fused |
 |---|---|---|---|
-| paged | 45.0 tok/s | 39.7 tok/s | **44.6 tok/s** (TTFT 378 ms) |
-| stateful + static decode | 41.3 tok/s | | **40.9 tok/s** |
+| B70 paged | 44.9 tok/s, TTFT 107 ms | 39.7 tok/s | **44.7 tok/s, TTFT 107 ms** |
+| B70 stateful + static decode | 41.3 tok/s | | **40.9 tok/s** |
+| LNL paged | 8.0 tok/s, TTFT 453 ms | | **7.0-7.8 tok/s, TTFT 425-470 ms** |
+
+Lunar Lake decode varies by +-6% between back-to-back runs (unified memory,
+thermals); the B70 numbers repeat to three digits. Same command as on the B70,
+no extra knobs.
 
 The fused run is deterministic across runs. Its tokens match the graph-level
 rotation for the first 135 tokens and then take a different (equally coherent)
 continuation: the FWHT accumulates in fp32 where the graph MatMul used fp16.
-Decoded output starts *"The user wants a concise explanation of photosynthesis
-in exactly or approximately 200 words..."*, then the essay.
+The LNL run and the stateful run fork from the B70 paged run at the same
+token 136 (a near-tie in the argmax). Decoded output starts *"The user wants a
+concise explanation of photosynthesis in exactly or approximately 200
+words..."*, then the essay.
+
+### 7.4 Prefill: M-tiled up-convert GEMM
+
+For `1 < M < 128` the up-convert kernel now runs a real M tile on the 16-bit
+DPAS (`WGM` 8 for M<=8, 16 for M<=16, else 32; `WGN` 64, `SGM` 8, `SGN` 16,
+`SGK` 128), i.e. one pass over the weights per row tile, instead of the
+per-row GEMV tier. The result is bit-identical to the GEMV tier (same tokens
+on the same binary). On the 21-token prompt: B70 TTFT 382 -> 107 ms, LNL
+1833 -> ~440 ms; decode is untouched. `XETLA_INT2_PREFILL_CFG=-1` restores the
+GEMV tier. The `M >= 128` path keeps its existing 128-wide GEMM tile. This
+applies to every ternary model, not only Bonsai 2.
 
 ```bash
 env BENCH_PRECISION=f16 BENCH_MAX_LEN=512 BENCH_NO_EOS=1 OV_XETLA_INT2_MERGE_MLP=1 \
@@ -529,6 +547,7 @@ Kernel:
 |---|---|
 | `XETLA_INT2_CFG_DEBUG=1` | Print the tile/k-slicing config chosen per shape |
 | `XETLA_INT2_DECODE_CFG=<n>` | Override the decode (M=1) configuration |
+| `XETLA_INT2_PREFILL_CFG=-1` | Use the per-row GEMV tier for 1<M<128 instead of the M-tiled GEMM (section 7.4) |
 | `XETLA_INT2_OPROJ_CFG=<n>` | Override the o_proj configuration |
 | `XETLA_INT2_KERNEL=upcvt` | Up-convert, fp16 DPAS everywhere (default) |
 | `XETLA_INT2_KERNEL=dpas_prefill` | int2 x int8 DPAS for M>1, up-convert for decode |

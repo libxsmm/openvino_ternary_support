@@ -564,6 +564,8 @@ sycl::event int2_upcvt_gemm_run(
     INT2_SCRATCH(4, 8);
   } else {
     INT2_SCRATCH(1, 1);
+    widen(upcvt_scratch_bytes<XT, 32, 64, 8, 16, 128, 1, 1, false>(M, N));
+    widen(upcvt_scratch_bytes<XT, 32, 64, 8, 16, 128, 1, 1, true>(M, N));
   }
 #undef INT2_SCRATCH
   auto& sc = get_scratch(q, need_acc, need_cnt);
@@ -754,6 +756,29 @@ sycl::event int2_upcvt_gemm_run(
   // n_pad is a multiple of 16, not always of the 128-wide wg tile.
   if (M >= 128 && N % 128 == 0) {
     DISPATCH_GEMM(32, 8, 128, 128, 32);
+  }
+  // 1 < M < 128: a real M tile on the 16-bit DPAS (one pass over the weights
+  // per 8/16/32 rows) instead of the per-row GEMV tier. B70 sweep: 5-7x faster
+  // at M=16..63 and bit-exact with the GEMV tier at every M.
+  // XETLA_INT2_PREFILL_CFG=-1 restores the GEMV tier.
+  if (M > 1 && N % 64 == 0) {
+    static const int pcfg = [] {
+      const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (pcfg != -1) {
+      if (xetla_int2_dispatch_debug()) {
+        static std::mutex m_mutex;
+        static std::set<std::tuple<size_t, size_t, size_t>> m_seen;
+        std::lock_guard<std::mutex> l(m_mutex);
+        if (m_seen.emplace(M, K, N).second)
+          fprintf(stderr, "[xetla-int2] M=%zu K=%zu N=%zu -> mtile wg_m=%d\n",
+                  (size_t)M, (size_t)K, (size_t)N, M <= 8 ? 8 : (M <= 16 ? 16 : 32));
+      }
+      if (M <= 8) DISPATCH_GEMM(8, 8, 64, 16, 128);
+      if (M <= 16) DISPATCH_GEMM(16, 8, 64, 16, 128);
+      DISPATCH_GEMM(32, 8, 64, 16, 128);
+    }
   }
   // A 128-wide workgroup tile over a much narrower output (the GatedDeltaNet
   // beta projection is N=48) asks for more than an integrated device grants and
