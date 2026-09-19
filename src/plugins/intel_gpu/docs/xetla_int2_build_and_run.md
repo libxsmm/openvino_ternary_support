@@ -3,7 +3,9 @@
 Instructions for building this fork and running a ternary (2-bit) model through
 the XeTLA `FullyConnected` implementation on an Intel discrete GPU.
 
-See [xetla_int2_architecture.md](xetla_int2_architecture.md) for how it works.
+See [xetla_int2_architecture.md](xetla_int2_architecture.md) for how it works and
+[xetla_int2_bonsai2_worklog.md](xetla_int2_bonsai2_worklog.md) for the record of
+the Bonsai 2 (rotated basis) work.
 
 ---
 
