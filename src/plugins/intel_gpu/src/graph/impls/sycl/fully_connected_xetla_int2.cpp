@@ -140,6 +140,11 @@ struct XetlaInt2Packed {
     memory::ptr staging_f32;  // decode-only f32 staging, when prefill and decode use different kernels
     size_t n_pad = 0;
     size_t staging_rows = 0;
+    // Hadamard input pre-transform: +-1 signs [K] (i8, may be null) and the
+    // rotated activation the GEMV reads instead of the node's input.
+    memory::ptr had_signs;
+    memory::ptr had_input;
+    size_t had_rows = 0;
 };
 
 static std::mutex& xetla_int2_packed_mutex() {
@@ -169,17 +174,24 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
     memory::ptr _staging;
     // Identifies this node's private k-slicing scratch inside the kernel.
     size_t _slot = 0;
+    memory::ptr _had_signs;
+    memory::ptr _had_input;
+    size_t _had_rows = 0;
 
     fully_connected_xetla_int2(const engine& engine, const ExecutionConfig& config,
                                memory::ptr packed_weights, memory::ptr scales, size_t N, size_t K,
-                               size_t n_pad, memory::ptr staging)
+                               size_t n_pad, memory::ptr staging,
+                               memory::ptr had_signs = nullptr, memory::ptr had_input = nullptr)
         : parent(engine, config),
           _packed_weights(std::move(packed_weights)),
           _scales(std::move(scales)),
           _N(N),
           _K(K),
           _n_pad(n_pad),
-          _staging(std::move(staging)) {
+          _staging(std::move(staging)),
+          _had_signs(std::move(had_signs)),
+          _had_input(std::move(had_input)),
+          _had_rows(_had_input ? 1 : 0) {
         static std::atomic<size_t> next_slot{1};
         _slot = next_slot++;
     }
@@ -230,6 +242,9 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         size_t n_pad = _n_pad;
         memory::ptr staging = _staging;
         memory::ptr staging_f32;
+        memory::ptr had_signs;
+        memory::ptr had_input;
+        const size_t had_block = params->typed_desc<fully_connected>()->hadamard_block;
         {
             std::lock_guard<std::mutex> lock(xetla_int2_packed_mutex());
             auto it = xetla_int2_packed_cache().find(params->desc->id);
@@ -248,10 +263,34 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
                     it->second.staging = staging;
                     it->second.staging_rows = M;
                 }
+                if (had_block != 0) {
+                    if (!it->second.had_input || M > it->second.had_rows) {
+                        auto hl = layout{ov::PartialShape{static_cast<int64_t>(M), static_cast<int64_t>(_K)},
+                                         data_types::f16, format::bfyx};
+                        it->second.had_input = instance.get_network().get_engine().allocate_memory(
+                            hl, allocation_type::usm_device, false);
+                        it->second.had_rows = M;
+                    }
+                    had_signs = it->second.had_signs;
+                    had_input = it->second.had_input;
+                }
             } else if (dbg) {
                 std::cerr << "[xetla-int2] MISS desc=" << params->desc->id << " inst=" << instance.id() << std::endl;
             }
         }
+        if (had_block != 0 && !had_input) {
+            // Cache miss (the node was renamed after compile): fall back to the
+            // impl's own buffers, growing the scratch for a longer prefill.
+            if (!_had_input || M > _had_rows) {
+                auto hl = layout{ov::PartialShape{static_cast<int64_t>(M), static_cast<int64_t>(_K)},
+                                 data_types::f16, format::bfyx};
+                _had_input = instance.get_network().get_engine().allocate_memory(hl, allocation_type::usm_device, false);
+                _had_rows = M;
+            }
+            had_signs = _had_signs;
+            had_input = _had_input;
+        }
+        OPENVINO_ASSERT(had_block == 0 || had_input, "[GPU] xetla int2: hadamard scratch missing for ", instance.id());
         const bool out_f32 = params->output_layouts[0].data_type == data_types::f32;
         // The fused epilogue is only implemented for the up-convert path, and the
         // int2 x int8 path always writes f16, so it keeps the separate post-op pass.
@@ -313,8 +352,8 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         }
 
 #ifdef OV_GPU_WITH_ZE_RT
-    if (std::getenv("OV_XETLA_INT2_ZE_DIRECT") != nullptr ||
-        std::getenv("OV_XETLA_INT2_ZE_DIRECT_QKV") != nullptr) {
+    if (had_block == 0 && (std::getenv("OV_XETLA_INT2_ZE_DIRECT") != nullptr ||
+        std::getenv("OV_XETLA_INT2_ZE_DIRECT_QKV") != nullptr)) {
             auto& ze_stream = downcast<ze::ze_stream>(stream);
             // A shape or post-op the direct table does not cover falls through
             // to the SYCL submission below rather than failing the inference.
@@ -349,15 +388,24 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
         if (force_barrier)
             sycl_queue.submit([=](::sycl::handler& cgh) { cgh.ext_oneapi_barrier(); });
 
+        void* gemm_in = instance.input_memory_ptr(0)->buffer_ptr();
+        if (had_block != 0) {
+            // Rotated-basis checkpoint: the GEMV consumes H(s*x) rather than x.
+            ov::intel_gpu::xetla_int2::hadamard_fwht_1024(
+                sycl_queue, M, _K, gemm_in, had_signs ? had_signs->buffer_ptr() : nullptr,
+                had_input->buffer_ptr());
+            gemm_in = had_input->buffer_ptr();
+        }
+
         auto ev = use_dpas
                       ? ov::intel_gpu::xetla_int2::gemv_f16_dpas(sycl_queue, M, n_pad, _K,
-                                                                instance.input_memory_ptr(0)->buffer_ptr(),
+                                                                gemm_in,
                                                                 packed_weights->buffer_ptr(),
                                                                 gemm_out,
                                                                 scales->buffer_ptr(),
                                                                 postop, postop_other)
                       : ov::intel_gpu::xetla_int2::gemv_f16(sycl_queue, M, n_pad, _K,
-                                                           instance.input_memory_ptr(0)->buffer_ptr(),
+                                                           gemm_in,
                                                            packed_weights->buffer_ptr(),
                                                            gemm_out,
                                                            scales->buffer_ptr(),
@@ -540,11 +588,25 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
             std::lock_guard<std::mutex> lock(xetla_int2_packed_mutex());
             if (std::getenv("OV_XETLA_INT2_DEBUG") != nullptr)
                 std::cerr << "[xetla-int2] REGISTER key=" << arg.id() << std::endl;
+            XetlaInt2Packed entry{packed_weights, scales, staging, staging_f32, n_pad, 1};
+            if (desc->hadamard_block != 0) {
+                OPENVINO_ASSERT(desc->hadamard_block == 1024 && K % 1024 == 0,
+                                "[GPU] xetla int2: hadamard block must be 1024 and divide K");
+                OPENVINO_ASSERT(desc->hadamard_signs.empty() || desc->hadamard_signs.size() == K,
+                                "[GPU] xetla int2: hadamard signs length mismatch");
+                if (!desc->hadamard_signs.empty()) {
+                    auto sl = layout{ov::PartialShape{static_cast<int64_t>(K)}, data_types::i8, format::bfyx};
+                    entry.had_signs = engine.allocate_memory(sl, allocation_type::usm_device, false);
+                    entry.had_signs->copy_from(stream, desc->hadamard_signs.data(), true);
+                }
+                auto hl = layout{ov::PartialShape{1, static_cast<int64_t>(K)}, data_types::f16, format::bfyx};
+                entry.had_input = engine.allocate_memory(hl, allocation_type::usm_device, false);
+                entry.had_rows = 1;
+            }
             // A second impl can be created for a node that is already executing
             // (new shape bucket). Replacing the entry would swap the buffers out
             // from under the live impl, which resolves them by node id per call.
-            auto res = xetla_int2_packed_cache().try_emplace(
-                arg.id(), XetlaInt2Packed{packed_weights, scales, staging, staging_f32, n_pad, 1});
+            auto res = xetla_int2_packed_cache().try_emplace(arg.id(), std::move(entry));
             if (!res.second) {
                 packed_weights = res.first->second.weights;
                 scales = res.first->second.scales;
@@ -591,14 +653,17 @@ struct fully_connected_xetla_int2 : typed_primitive_sycl_impl<fully_connected> {
                       << " max_diff=" << max_diff << std::endl;
         }
 
-        memory::ptr own_staging;
+        memory::ptr own_staging, own_had_signs, own_had_input;
         {
             std::lock_guard<std::mutex> lock(xetla_int2_packed_mutex());
-            own_staging = xetla_int2_packed_cache()[arg.id()].staging;
+            auto& e = xetla_int2_packed_cache()[arg.id()];
+            own_staging = e.staging;
+            own_had_signs = e.had_signs;
+            own_had_input = e.had_input;
         }
         return std::make_unique<fully_connected_xetla_int2>(engine, prog.get_config(),
                                                            packed_weights, scales, N, K,
-                                                           n_pad, own_staging);
+                                                           n_pad, own_staging, own_had_signs, own_had_input);
     }
 };
 

@@ -60,6 +60,10 @@ struct XetlaInt2FCImplementationManager : public ImplementationManager {
     do {                                                                         \
         if (dbg)                                                                 \
             std::cerr << "[xetla-int2] reject: " << (reason) << " node=" << fc_node.id() << std::endl;         \
+        /* a fused Hadamard input exists only here; another impl would ignore it */ \
+        OPENVINO_ASSERT(fc_prim->hadamard_block == 0,                            \
+                        "[GPU] xetla int2: ", fc_node.id(), " carries a Hadamard input transform but ", \
+                        "the XeTLA impl rejected it: ", (reason));               \
         return false;                                                            \
     } while (0)
 

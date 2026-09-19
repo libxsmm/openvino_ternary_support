@@ -98,6 +98,7 @@
 #include "plugin/transformations/fold_activation_transpose.hpp"
 #include "plugin/transformations/fuse_gated_mlp.hpp"
 #include "plugin/transformations/fuse_rms_rope.hpp"
+#include "plugin/transformations/fuse_hadamard_fc.hpp"
 #include "plugin/transformations/fuse_atan2_decomposed.hpp"
 #include "plugin/transformations/fuse_moe_router.hpp"
 #include "plugin/transformations/fuse_moe_router_scale.hpp"
@@ -1640,6 +1641,11 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             if (device_info.arch != cldnn::gpu_arch::xe2 && (!config.get_enable_lora_operation() || device_info.supports_immad)) {
                 manager.register_pass<ov::intel_gpu::LoRAHorizontalFusion>();
             }
+        }
+        // After the horizontal fusion so a merged gate/up FC absorbs the shared
+        // rotation once. OV_XETLA_INT2_FUSE_HADAMARD=0 keeps it in the graph.
+        if (const char* e = std::getenv("OV_XETLA_INT2_FUSE_HADAMARD"); e == nullptr || std::string(e) != "0") {
+            manager.register_pass<ov::intel_gpu::FuseHadamardIntoFC>();
         }
 
         // ZP should not be folded for FC. But still, ZP should be folded for Gather.

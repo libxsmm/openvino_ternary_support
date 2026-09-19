@@ -44,6 +44,11 @@ sycl::event gemv_f16_dpas(sycl::queue& q, size_t M, size_t N, size_t K,
 
 enum class Variant { upcvt_fp16, dpas_i2xi8, dpas_prefill_only };
 
+// y = H_1024 (signs * x) / 32 per 1024-block along K of a [rows, K] f16 tensor;
+// `signs` is an int8 +-1 vector of length K on the device, or null.
+sycl::event hadamard_fwht_1024(sycl::queue& q, size_t rows, size_t K, const void* x,
+                               const void* signs, void* y);
+
 // XETLA_INT2_KERNEL=upcvt|dpas|dpas_prefill selects the variant. Both run on
 // DPAS: up-convert dequantizes the weights to fp16 and uses fp16 DPAS, while
 // dpas quantizes activations to int8 and uses integer DPAS. Up-convert is the

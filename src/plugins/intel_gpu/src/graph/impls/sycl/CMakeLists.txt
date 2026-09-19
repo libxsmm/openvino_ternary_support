@@ -14,7 +14,8 @@ set(SOURCES_OCL_RT
     "${CMAKE_CURRENT_SOURCE_DIR}/impl_example.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fully_connected_xetla_int2.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/xetla/xetla_int2_gemv.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/xetla/xetla_int2_dpas.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/xetla/xetla_int2_dpas.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/xetla/hadamard_fwht.cpp")
 
 if(GPU_RT_TYPE STREQUAL "SYCL")
     set(EXCLUDED_SOURCE_PATHS ${SOURCES_OCL_RT})

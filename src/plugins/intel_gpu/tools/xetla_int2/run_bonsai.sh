@@ -45,3 +45,11 @@ env BENCH_PRECISION=f16 BENCH_MAX_LEN=512 BENCH_STATIC_DECODE=1 BENCH_NO_EOS=1 \
     "$BENCH/bench_llm_27b" "$MODELS/bonsai27b-u2/openvino_model.xml" \
     "$MODELS/bonsai27b-fp16/openvino_text_embeddings_model.xml" GPU "$TOKENS" "$IDS" \
     2>&1 | grep -aE "TTFT|decode |generated_ids"
+
+if [ -f "$MODELS/bonsai2-27b-u2/openvino_model.xml" ]; then
+    echo "### Bonsai 2 27B, paged (fused Hadamard input transform)"
+    env BENCH_PRECISION=f16 BENCH_MAX_LEN=512 BENCH_NO_EOS=1 OV_XETLA_INT2_MERGE_MLP=1 \
+        "$BENCH/paged_bench_llm_27b" "$MODELS/bonsai2-27b-u2/openvino_model.xml" \
+        "$MODELS/bonsai2-27b-u2/openvino_text_embeddings_model.xml" GPU "$TOKENS" "$IDS" \
+        2>&1 | grep -aE "TTFT|decode |generated_ids"
+fi

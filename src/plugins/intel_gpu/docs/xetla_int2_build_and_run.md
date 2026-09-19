@@ -366,6 +366,8 @@ token-identical, and each model produces the same tokens on both GPUs:
 | 8B | paged | 147.4 | 36.3 |
 | 27B | paged | 45.0 | 7.4 |
 | 27B | stateful + static decode | 41.3 | 6.6 |
+| Bonsai 2 27B | paged | 44.6 | |
+| Bonsai 2 27B | stateful + static decode | 40.9 | |
 
 Paged is ahead on every model on B70. On Lunar Lake it leads clearly for 1.7B
 and 4B, while the two 27B paths sit within run-to-run variance of each other.
@@ -399,11 +401,95 @@ once to get a representative number, or keep a persistent cache:
 export SYCL_CACHE_PERSISTENT=1 SYCL_CACHE_DIR=/tmp/syclcache_bonsai
 ```
 
+---
+
+## 7. Bonsai 2 27B (Hadamard-rotated basis)
+
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+ships only as GGUF (`PQ2_0`), has the same Qwen3.5-27B architecture as Bonsai
+27B, and stores its ternary weights in a *rotated basis*: the input of every
+folded projection is sign-flipped and put through a blockwise (1024) normalised
+Walsh-Hadamard transform, and the token embedding is stored rotated (whitepaper
+A.2; the `prism.hadamard.*` GGUF metadata carries the contract).
+
+### 7.1 Build the IR
+
+The Bonsai 1 u2 IR from section 5 is the graph template; the tool swaps every
+weight in from the GGUF and inserts the rotation:
+
+```bash
+# gguf-py of the PrismML llama.cpp fork (stock gguf does not know PQ2_0)
+git clone --depth 1 -b prism https://github.com/PrismML-Eng/llama.cpp llama.cpp-prism
+./venv/bin/pip install pyyaml
+
+./venv/bin/python src/plugins/intel_gpu/tools/xetla_int2/bonsai2_gguf_to_ir.py \
+  --gguf           <Ternary-Bonsai-2-27B-PQ2_0.gguf> \
+  --template-dir   bonsai27b-u2 \
+  --template-embed bonsai27b-fp16/openvino_text_embeddings_model.xml \
+  --gguf-py        llama.cpp-prism/gguf-py \
+  --out-dir        bonsai2-27b-u2
+```
+
+About 40 s. It writes `openvino_model.xml` (6.9 GB) and
+`openvino_text_embeddings_model.xml` (2.5 GB, bf16, inverse rotation applied
+offline). What it does:
+
+* `PQ2_0` blocks are byte-for-byte the `u2` layout the plugin expects (codes
+  `{0,1,2}`, zero point 1, fp16 scale per 128), so the 401 ternary matrices are
+  copied, not re-quantized. llama.cpp's tiled GDN value-head order is undone the
+  way the HF graph expects; the 96 GDN gate projections (`in_proj_a/b`) are
+  dense bf16 in this release and replace the template's u2 subgraph.
+* Norm weights, `A_log`, `dt_bias`, `conv1d` and the embedding come from the
+  GGUF (norms are stored as `1+w`, which is what the exported graph holds).
+* The rotation is inserted as `Reshape -> MatMul(H_1024) -> Reshape` in front
+  of 257 projections (one shared 2 MB constant). Sign flips are folded into the
+  preceding RMSNorm weight (129 norms; the dense `in_proj_a/b` are compensated),
+  into the `up_proj` rows for `down_proj`'s input (64), and stay an explicit
+  `Multiply` only for the 64 attention/GDN output projections, whose producer is
+  not a per-channel weight.
+
+`--verify` runs the same extraction on the *Bonsai 1* GGUF and compares it with
+the Bonsai 1 IR: all 497 ternary matrices and the embedding are bit-identical,
+the dense tensors match to fp16 rounding. `--explicit-signs` keeps every sign
+flip as a `Multiply` (debug; same tokens).
+
+### 7.2 Fused input transform
+
+The GPU plugin folds the graph-level rotation back into the FullyConnected
+(`FuseHadamardIntoFC`, registered after the horizontal FC fusion so a merged
+gate/up projection absorbs the shared rotation once). The FC primitive carries
+`hadamard_block` / `hadamard_signs`; the XeTLA int2 impl runs one fused
+sign+FWHT SYCL kernel (`xetla/hadamard_fwht.cpp`, 128 items per 1024-block,
+fp32 butterflies, launch-bound at decode) into a per-node scratch and points the
+GEMV at it. Only the XeTLA impl honours the fields, so the impl manager throws
+rather than silently falling back if such an FC is rejected.
+`OV_XETLA_INT2_FUSE_HADAMARD=0` leaves the rotation in the graph;
+`OV_XETLA_HADAMARD_DEBUG=1` traces the match.
+
+### 7.3 Results (B70, 256 tokens, `BENCH_NO_EOS=1`, photosynthesis prompt)
+
+| Path | Bonsai 27B | Bonsai 2 27B, rotation in graph | Bonsai 2 27B, fused |
+|---|---|---|---|
+| paged | 45.0 tok/s | 39.7 tok/s | **44.6 tok/s** (TTFT 378 ms) |
+| stateful + static decode | 41.3 tok/s | | **40.9 tok/s** |
+
+The fused run is deterministic across runs. Its tokens match the graph-level
+rotation for the first 135 tokens and then take a different (equally coherent)
+continuation: the FWHT accumulates in fp32 where the graph MatMul used fp16.
+Decoded output starts *"The user wants a concise explanation of photosynthesis
+in exactly or approximately 200 words..."*, then the essay.
+
+```bash
+env BENCH_PRECISION=f16 BENCH_MAX_LEN=512 BENCH_NO_EOS=1 OV_XETLA_INT2_MERGE_MLP=1 \
+  ./build/paged_bench_llm_27b bonsai2-27b-u2/openvino_model.xml \
+  bonsai2-27b-u2/openvino_text_embeddings_model.xml GPU 256 "$(cat prompt_photosynthesis_27b.txt)"
+```
+
 To compare against the stock path, set `OV_XETLA_INT2_DISABLE=1` and re-run.
 
 ---
 
-## 7. Verifying correctness
+## 8. Verifying correctness
 
 Decode is deterministic run to run: two runs with the same prompt produce
 identical `generated_ids`.
@@ -422,7 +508,7 @@ remains the authoritative check.
 
 ---
 
-## 8. Environment switches
+## 9. Environment switches
 
 Plugin:
 
@@ -434,6 +520,8 @@ Plugin:
 | `OV_XETLA_INT2_BARRIER=1` | Insert an explicit queue barrier before each GEMM |
 | `OV_XETLA_INT2_DPAS_FOLD=1` | Fold post-ops into the int2 x int8 epilogue instead of the separate pass |
 | `OV_XETLA_INT2_VERIFY=1` | At load time, dequantize the packed buffers and compare against the IR constant |
+| `OV_XETLA_INT2_FUSE_HADAMARD=0` | Keep the Bonsai 2 input rotation as graph ops instead of fusing it into the FC (section 7) |
+| `OV_XETLA_HADAMARD_DEBUG=1` | Trace the `FuseHadamardIntoFC` match per FullyConnected |
 
 Kernel:
 
