@@ -488,12 +488,45 @@ token 136 (a near-tie in the argmax). Decoded output starts *"The user wants a
 concise explanation of photosynthesis in exactly or approximately 200
 words..."*, then the essay.
 
-### 7.4 Prefill: M-tiled up-convert GEMM
+### 7.4 Accuracy with lm-evaluation-harness (batched serving)
 
-For `1 < M < 128` the up-convert kernel now runs a real M tile on the 16-bit
+`tools/xetla_int2/paged_serve_llm_27b` serves a file of token-id requests with
+continuous batching over the paged export (per-slot KV block ranges and
+linear-attention state slots, a joint decode step, a `Gather` of the wanted
+rows in front of `lm_head` so a prefill only emits the last token's logits).
+`tools/xetla_int2/lm_eval_ov.py` is an lm-evaluation-harness LM that routes
+every `generate_until` batch through it (chat template, thinking with
+`reasoning_effort`, answer taken after `</think>`, greedy);
+`run_lm_eval_ov.sh <jobid> <tag>` wraps both (`LIMIT`, `BATCH`, `THINK`,
+`TASKS`).
+
+Bonsai 2 27B, GSM8K test set (1319), `gsm8k_cot_llama` 8-shot, thinking
+`medium`, greedy, B70, batch 16 -- against the same protocol on the vLLM
+plugin (`xetla_vllm_plugin/scripts/eval_bonsai2_lm_eval.sh`):
+
+| | OpenVINO + XeTLA int2 | vLLM + XeTLA int2 |
+|---|---|---|
+| exact match | **96.8%** (1277/1319) | 96.7% (1276/1319) |
+| wall (1319 examples) | 89.8 min, 4.08 s/example | 90.5 min, 4.12 s/example |
+
+38 items are wrong on both, 4 only here, 5 only on vLLM (fp-ordering noise
+on near-tie items). The model card's math group is 96.57.
+
+One bug was found on the way: the paged linear-attention ops always start
+from the state in `la.block_indices[begin]` -- `past_len == 0` does *not*
+imply a zero state (the op spec leaves zeroing to the user). A slot reused
+without clearing its two state blocks inherits the previous request's GDN
+state; accuracy then decayed from 96% on the first 130 requests to 87.4%
+overall with runaway generations. The server clears the slot's state blocks
+device-to-device on every refill; single-sequence benchmarks never hit this.
+
+### 7.5 Prefill: M-tiled up-convert GEMM
+
+For every `M > 1` the up-convert kernel now runs a real M tile on the 16-bit
 DPAS (`WGM` 8 for M<=8, 16 for M<=16, else 32; `WGN` 64, `SGM` 8, `SGN` 16,
 `SGK` 128), i.e. one pass over the weights per row tile, instead of the
-per-row GEMV tier. The result is bit-identical to the GEMV tier (same tokens
+per-row GEMV tier (M<128) or the earlier 128-wide tile (M>=128, ~8 ms/token
+on the 27B: a 1260-token prompt went from 10.1 s to 3.2 s; `-2` keeps it). The result is bit-identical to the GEMV tier (same tokens
 on the same binary). On the 21-token prompt: B70 TTFT 382 -> 107 ms, LNL
 1833 -> ~440 ms; decode is untouched. `XETLA_INT2_PREFILL_CFG=-1` restores the
 GEMV tier. The `M >= 128` path keeps its existing 128-wide GEMM tile. This
@@ -549,7 +582,7 @@ Kernel:
 |---|---|
 | `XETLA_INT2_CFG_DEBUG=1` | Print the tile/k-slicing config chosen per shape |
 | `XETLA_INT2_DECODE_CFG=<n>` | Override the decode (M=1) configuration |
-| `XETLA_INT2_PREFILL_CFG=-1` | Use the per-row GEMV tier for 1<M<128 instead of the M-tiled GEMM (section 7.4) |
+| `XETLA_INT2_PREFILL_CFG=-1` / `-2` | `-1`: per-row GEMV tier for M>1; `-2`: the old 128-wide tile for M>=128 (section 7.5) |
 | `XETLA_INT2_OPROJ_CFG=<n>` | Override the o_proj configuration |
 | `XETLA_INT2_KERNEL=upcvt` | Up-convert, fp16 DPAS everywhere (default) |
 | `XETLA_INT2_KERNEL=dpas_prefill` | int2 x int8 DPAS for M>1, up-convert for decode |

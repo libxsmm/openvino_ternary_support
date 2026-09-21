@@ -106,7 +106,17 @@ are deterministic on the B70. Fused vs graph-level rotation, paged vs
 stateful, and B70 vs LNL all agree through token 135 and fork at token 136
 (fp32 FWHT vs fp16 MatMul accumulation; a near-tie argmax).
 
-## 6. Not done / open
+## 6. Harness check (2026-09-20/21)
+
+lm-evaluation-harness GSM8K (1319, 8-shot, thinking medium, greedy) through a
+new continuous-batching server (`paged_serve_llm_27b`, batch 16): **96.8%**
+in 89.8 min vs 96.7% / 90.5 min for the vLLM plugin with the same protocol
+(38 common misses, 4 vs 5 unique). Two things had to be fixed first: the
+`M >= 128` prefill still used the old wide tile (4x slower than the M tile),
+and a reused slot inherited the previous request's linear-attention state
+(the paged ops do not zero at `past_len == 0`), which had produced 87.4%.
+
+## 7. Not done / open
 
 * No BITCOS variant here (int2 only, as requested).
 * The FWHT is a separate kernel in front of the GEMV, not a prologue inside
