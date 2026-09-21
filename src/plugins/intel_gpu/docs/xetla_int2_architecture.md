@@ -41,6 +41,9 @@ notes where the two differ.
 | `impls/sycl/fully_connected_xetla_int2.cpp` | Weight packing, buffers, execution, variant dispatch |
 | `impls/sycl/xetla/xetla_int2_gemv.cpp` | Up-convert kernel, epilogue, tuning table |
 | `impls/sycl/xetla/xetla_int2_dpas.cpp` | int2 x int8 kernel and its activation-scale reduction |
+| `impls/sycl/xetla/hadamard_fwht.cpp` | Fused sign flip + blockwise Walsh-Hadamard input transform (rotated-basis checkpoints, section 8) |
+| `plugin/transformations/fuse_hadamard_fc.cpp` | Folds the graph-level rotation into the `FullyConnected` primitive |
+| `plugin/transformations/fuse_rms_rope.cpp` | Optional fold of the per-head Q/K RMSNorm into the RoPE kernel (`OV_GPU_FUSE_RMS_ROPE=1`) |
 | `registry/fully_connected_impls.cpp` | Priority relative to oneDNN/OpenCL |
 
 XeTLA is used as an unmodified header-only template library.
@@ -65,13 +68,22 @@ holds; anything else falls through to the existing paths unchanged:
 - weights are constant, `u2`, shaped `[N, K]`, with `K % 128 == 0`
 - activations are `f16`, `bfyx`, unpadded
 - output is `f16` or `f32`, `bfyx`, unpadded
-- no bias
-- fused primitives limited to a trailing `swish`, or an `eltwise` `sum`/`prod`
-  with an f16 outer dependency
+- a constant bias only when nothing else is fused after it and the up-convert
+  variant is selected (it is folded into the epilogue, `POSTOP = 3`)
+- fused primitives limited to a trailing `swish`, a trailing `logistic`
+  (sigmoid, `POSTOP = 4`), or an `eltwise` `sum`/`prod` with an f16 outer
+  dependency
+
+`OV_XETLA_INT2_FOLD_GATES=bias|sigmoid|none` narrows the bias/sigmoid folds
+(default: both), which the GatedDeltaNet gate projections `in_proj_a` /
+`in_proj_b` of the hybrid 27B rely on.
 
 Acceptance is conservative and per-node, so the path is incremental: a layer
 that does not qualify simply runs as before. Acceptance does not depend on the
-variant; both consume the same packed buffers.
+variant; both consume the same packed buffers. One exception: a node whose
+primitive carries a Hadamard input transform (section 8) is rejected with an
+error rather than falling through, because no other implementation would apply
+the transform.
 
 ---
 
@@ -142,6 +154,15 @@ its own node's buffers. Entries are created once per node and reused
 thereafter, so the buffers a running implementation uses remain stable for the
 lifetime of the model.
 
+### 3.7 Hadamard input transform (rotated-basis checkpoints)
+
+When the primitive carries `hadamard_block` (section 8), `create()` also
+uploads the `+-1` sign vector (`int8[K]`, absent when the signs were folded
+into the producing weight) and allocates an `[M, K]` f16 scratch that receives
+the transformed activation; the GEMV reads that scratch instead of the node's
+input. Both live in the same node-id cache entry and, as a fallback for a cache
+miss (a node renamed after compile), on the implementation itself.
+
 ---
 
 ## 4. Execution path
@@ -149,9 +170,12 @@ lifetime of the model.
 ```mermaid
 flowchart TD
     A["execute_impl"] --> B["resolve packed weights,<br/>scales, staging by node id"]
-    B --> C["select variant<br/>(XETLA_INT2_KERNEL, M)"]
+    B --> B2{"hadamard_block?"}
+    B2 -->|yes| B3["fused sign + FWHT kernel<br/>x -> H_1024(s*x)/32 into scratch"]
+    B2 -->|no| C
+    B3 --> C["select variant<br/>(XETLA_INT2_KERNEL, M)"]
     C --> D{"variant"}
-    D -->|"up-convert"| E["inspect fused post-ops<br/>POSTOP = 0 / 1 / 2"]
+    D -->|"up-convert"| E["inspect fused post-ops<br/>POSTOP = 0 / 1 / 2 / 3 / 4"]
     D -->|"int2 x int8"| F["quantize activations to int8<br/>(scale reduction kernel)"]
     E --> G["gemv_f16(M, n_pad, K, ..., postop, other, out_f32)"]
     F --> H["gemv_f16_dpas(M, n_pad, K, ..., postop, other)"]
@@ -178,6 +202,13 @@ dependency:
 |---|---|---|
 | `swish` then `eltwise prod` | gate_proj x up_proj | 1 |
 | `eltwise sum` | o_proj, down_proj (residual add) | 2 |
+| constant bias | GatedDeltaNet `in_proj_a` | 3 |
+| `logistic` | GatedDeltaNet `in_proj_b` | 4 |
+
+With `OV_XETLA_INT2_MERGE_MLP=1` the plugin's horizontal FC fusion merges the
+parallel gate/up projections into one 2N-wide compressed FC followed by the
+existing SwiGLU primitive, so the weights are streamed once per token; the
+default GEMV tuning table has entries for the merged shapes.
 
 Folding removes a full-tensor read-modify-write pass per layer: the activation
 and the residual add are applied in registers while the accumulator tile is
@@ -279,14 +310,27 @@ Narrow workgroups (`WGN = 32`) suit GEMV, where parallelism across `N` matters
 more than tile reuse; the local k-slicing factor `LS` balances the K reduction
 against subgroup occupancy and is tuned per shape.
 
-`XETLA_INT2_CFG_DEBUG=1` prints the selection;
+The dispatcher distinguishes integrated from discrete Xe2 (`is_integrated_gpu`)
+and keeps a separate decode table for Lunar Lake, whose bandwidth is several
+times lower than the B70's (see the build-and-run document for the tuned
+tiles). `XETLA_INT2_CFG_DEBUG=1` prints the selection;
 `XETLA_INT2_DECODE_CFG` / `XETLA_INT2_OPROJ_CFG` override it for sweeps.
 
 K-slicing scratch is a single process-wide buffer that only grows, sized for
-the worst case across the compiled instantiations.
+the worst case across the compiled instantiations that the current `M` can
+reach (prefill never k-slices, so it does not pay for the decode tiers).
 
-Prefill (`M > 1`) on the up-convert path uses a generic configuration and is not
-tuned.
+### Prefill (`M > 1`)
+
+Every `M > 1` call on the up-convert path runs a real M tile on the fp16 DPAS
+(`WGM` 8 for `M <= 8`, 16 for `M <= 16`, else 32; `WGN` 64, `SGM` 8, `SGN` 16,
+`SGK` 128, no k-slicing): one pass over the weights per row tile instead of
+one per token. It is bit-identical to the GEMV tier at every `M` and, on the
+27B, 5-7x faster at chat-length prompts and 4x faster than the earlier
+128-wide GEMM tile at `M >= 128` (~2.5 ms/token on a B70).
+`XETLA_INT2_PREFILL_CFG=-1` restores the per-row GEMV tier, `-2` the old wide
+tile, for A/B measurements. Outputs narrower than 64 (`N % 64 != 0`, e.g. the
+GDN beta projection) keep the GEMV tier.
 
 ---
 
@@ -302,3 +346,33 @@ tuned.
 
 The best variant depends on prompt length and on the target device, so it should
 be measured rather than assumed.
+
+---
+
+## 8. Rotated-basis checkpoints (Hadamard input transform)
+
+Bonsai 2 stores its ternary weights in a rotated basis: every folded projection
+expects its input `x` to be replaced by `H_1024 (s * x) / 32`, applied per
+1024-wide block along `K` with a fixed `+-1` sign vector `s`, and the token
+embedding is stored rotated. In the IR this arrives as
+`[Multiply(s)] -> Reshape(..., K/1024, 1024) -> MatMul(H) -> Reshape(..., K)`
+in front of the compressed `FullyConnected` (produced offline by
+`tools/xetla_int2/bonsai2_gguf_to_ir.py`, which also folds most sign vectors
+into the preceding RMSNorm weights or `up_proj` rows and applies the inverse
+rotation to the embedding table).
+
+`FuseHadamardIntoFC` (a model pass registered after the horizontal FC fusion,
+so a merged gate/up FC absorbs the shared rotation once) recognises that chain,
+verifies the constant is the normalised Sylvester `H_1024`, rewires the FC to
+the original activation and records `hadamard_block` / `hadamard_signs` on the
+`FullyConnectedCompressed` rt_info; the FC translator moves them onto the cldnn
+`fully_connected` primitive (part of its hash and serialization).
+
+At execution the implementation runs `hadamard_fwht.cpp` in front of the GEMV:
+one work-group of 128 items per 1024-block, the ten radix-2 stages as four
+register passes (three radix-8 gathers through SLM and a final radix-2 pass
+that scales and stores), fp32 butterflies with fp16 only at load and store. At
+decode it is launch-bound; on the 27B the fused path recovers the ~12% that
+the graph-level rotation cost (39.7 -> 44.7 tok/s on a B70).
+`OV_XETLA_INT2_FUSE_HADAMARD=0` leaves the rotation in the graph;
+`OV_XETLA_HADAMARD_DEBUG=1` traces the match.

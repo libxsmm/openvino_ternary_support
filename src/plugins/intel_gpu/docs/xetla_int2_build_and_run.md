@@ -5,7 +5,9 @@ the XeTLA `FullyConnected` implementation on an Intel discrete GPU.
 
 See [xetla_int2_architecture.md](xetla_int2_architecture.md) for how it works and
 [xetla_int2_bonsai2_worklog.md](xetla_int2_bonsai2_worklog.md) for the record of
-the Bonsai 2 (rotated basis) work.
+the Bonsai 2 (rotated basis) work. For Bonsai 2 27B specifically, the curated
+from-scratch sequence (download, build, IR conversion, B70 and Lunar Lake runs)
+is [xetla_int2_bonsai2_from_scratch.md](xetla_int2_bonsai2_from_scratch.md).
 
 ---
 
