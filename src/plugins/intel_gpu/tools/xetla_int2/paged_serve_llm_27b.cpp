@@ -21,6 +21,9 @@
 #include <openvino/op/parameter.hpp>
 #include <openvino/pass/manager.hpp>
 #include <openvino/pass/sdpa_to_paged_attention.hpp>
+// dev API: ROI copy into a remote tensor (zeroing one slot of a state table)
+#include <openvino/runtime/iremote_tensor.hpp>
+#include <openvino/runtime/make_tensor.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +33,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -173,6 +177,7 @@ int main(int argc, char** argv) {
         auto request = lm.create_infer_request();
 
         std::vector<ov::Tensor> caches;
+        std::vector<std::string> cache_names;
         ov::RemoteContext context = lm.get_context();
         auto bind = [&](const std::string& name, size_t blocks) {
             const auto port = lm.input(name);
@@ -185,6 +190,7 @@ int main(int argc, char** argv) {
             auto remote = context.create_tensor(port.get_element_type(), shape);
             remote.copy_from(zeros);
             caches.emplace_back(std::move(remote));
+            cache_names.push_back(name);
             request.set_tensor(name, caches.back());
         };
         for (int32_t layer = 0; layer < kFullAttnLayers; ++layer) {
@@ -196,6 +202,38 @@ int main(int argc, char** argv) {
             bind("gated_delta_state_table." + std::to_string(layer), static_cast<size_t>(kLinearAttnSlots) * batch);
         }
         set_i32_scalar(request, "max_context_len", max_context_len);
+        // One zeroed device tensor per state-table shape ([2 slots, ...]);
+        // zero_slot_state copies it over a slot pair device-to-device.
+        std::vector<size_t> la_cache_idx;
+        std::map<std::string, ov::Tensor> zero_blocks;
+        for (size_t i = 0; i < caches.size(); ++i) {
+            if (cache_names[i].rfind("key_cache", 0) == 0 || cache_names[i].rfind("value_cache", 0) == 0)
+                continue;
+            la_cache_idx.push_back(i);
+            ov::Shape slot_shape = caches[i].get_shape();
+            slot_shape[0] = kLinearAttnSlots;
+            const std::string key = caches[i].get_element_type().get_type_name() + ":" + slot_shape.to_string();
+            if (!zero_blocks.count(key)) {
+                ov::Tensor zeros(caches[i].get_element_type(), slot_shape);
+                std::memset(zeros.data(), 0, zeros.get_byte_size());
+                auto remote = context.create_tensor(caches[i].get_element_type(), slot_shape);
+                remote.copy_from(zeros);
+                zero_blocks.emplace(key, std::move(remote));
+            }
+        }
+        auto zero_slot_state = [&](int32_t s) {
+            for (const size_t i : la_cache_idx) {
+                ov::Shape slot_shape = caches[i].get_shape();
+                slot_shape[0] = kLinearAttnSlots;
+                const std::string key = caches[i].get_element_type().get_type_name() + ":" + slot_shape.to_string();
+                const size_t slot_bytes = caches[i].get_byte_size() / caches[i].get_shape()[0];
+                auto dst = std::dynamic_pointer_cast<ov::IRemoteTensor>(ov::get_tensor_impl(caches[i])._ptr);
+                auto src = ov::get_tensor_impl(zero_blocks.at(key))._ptr;
+                if (!dst)
+                    throw std::runtime_error("state table is not a remote tensor");
+                dst->copy_from(src, 0, static_cast<size_t>(s) * kLinearAttnSlots * slot_bytes, slot_shape);
+            }
+        };
         {
             size_t bytes = 0;
             for (const auto& t : caches)
@@ -293,6 +331,10 @@ int main(int argc, char** argv) {
                 const size_t r = pending.front();
                 pending.pop_front();
                 slots[s] = Slot{};
+                // The paged linear-attention ops always start from the state in
+                // block_indices[begin] (past_len == 0 does not imply zero), so a
+                // reused slot must have its two state blocks cleared first.
+                zero_slot_state(s);
                 slots[s].active = true;
                 slots[s].req = r;
                 feed_embeds(requests[r].prompt);

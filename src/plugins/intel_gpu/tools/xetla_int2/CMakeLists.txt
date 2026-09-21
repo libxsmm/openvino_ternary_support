@@ -13,3 +13,9 @@ foreach(tool bench_llm paged_bench_llm bench_llm_27b paged_bench_llm_27b paged_s
     add_executable(${tool} ${tool}.cpp)
     target_link_libraries(${tool} PRIVATE openvino::runtime)
 endforeach()
+
+# paged_serve_llm_27b zeroes one slot of a state table with the plugin's ROI
+# copy, which is only reachable through the dev API.
+get_filename_component(OV_SRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+target_include_directories(paged_serve_llm_27b PRIVATE
+    "${OV_SRC_ROOT}/src/inference/dev_api" "${OV_SRC_ROOT}/src/core/dev_api")
