@@ -750,22 +750,20 @@ sycl::event int2_upcvt_gemm_run(
       DISPATCH(128, 1, 1);
     }
   }
-  // M>1 prefill. The GEMV tile stays ahead for chat-length prompts (M=21:
-  // 0.41 s) but scales at ~17 ms/token, while the XMX GEMM tile costs
-  // ~7.5 ms/token and takes over around M~100 (M=1024: 7.7 s vs 17.6 s).
-  // n_pad is a multiple of 16, not always of the 128-wide wg tile.
-  if (M >= 128 && N % 128 == 0) {
+  // M>1 prefill: a real M tile on the 16-bit DPAS (one pass over the weights
+  // per 8/16/32 rows) instead of the per-row GEMV tier. B70 sweep: 5-7x faster
+  // at M=16..63, bit-exact with the GEMV tier at every M, and at M>=128 4x
+  // faster than the earlier (WGM 32, WGN 128, SGN 128, SGK 32) tile, which
+  // cost ~8 ms/token on the 27B (640-token prompt: 5.2 s -> 1.3 s).
+  // XETLA_INT2_PREFILL_CFG=-1 restores the GEMV tier, -2 the old wide tile.
+  static const int pcfg = [] {
+    const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (pcfg == -2 && M >= 128 && N % 128 == 0) {
     DISPATCH_GEMM(32, 8, 128, 128, 32);
   }
-  // 1 < M < 128: a real M tile on the 16-bit DPAS (one pass over the weights
-  // per 8/16/32 rows) instead of the per-row GEMV tier. B70 sweep: 5-7x faster
-  // at M=16..63 and bit-exact with the GEMV tier at every M.
-  // XETLA_INT2_PREFILL_CFG=-1 restores the GEMV tier.
   if (M > 1 && N % 64 == 0) {
-    static const int pcfg = [] {
-      const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
-      return e ? std::atoi(e) : 0;
-    }();
     if (pcfg != -1) {
       if (xetla_int2_dispatch_debug()) {
         static std::mutex m_mutex;

@@ -8,7 +8,8 @@ find_package(OpenVINO REQUIRED)
 # bench_llm         8B, stateful (indirect SDPA)
 # paged_bench_llm   8B, SDPAToPagedAttention
 # *_27b             the VLM decoder: separate embedding model, rank-3 mrope
-foreach(tool bench_llm paged_bench_llm bench_llm_27b paged_bench_llm_27b)
+# paged_serve_llm_27b  batched (continuous-batching) generation from a request file, for eval harnesses
+foreach(tool bench_llm paged_bench_llm bench_llm_27b paged_bench_llm_27b paged_serve_llm_27b)
     add_executable(${tool} ${tool}.cpp)
     target_link_libraries(${tool} PRIVATE openvino::runtime)
 endforeach()
