@@ -10,6 +10,7 @@
 #include "fully_connected_inst.h"
 #include "intel_gpu/runtime/kernel_args.hpp"
 #include "intel_gpu/runtime/memory.hpp"
+#include "openvino/core/parallel.hpp"
 #include "primitive_inst.h"
 #include "reorder_inst.h"
 #include "runtime/ocl/ocl_engine.hpp"
@@ -51,6 +52,89 @@ void pack_weights(const uint8_t* src, uint32_t* dst, size_t N, size_t K, int32_t
             dst[(k / kTernoclPackFactor) * N + n] |= static_cast<uint32_t>(code & 0x3) << (2 * (k % kTernoclPackFactor));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// BITCOS (experimental, OV_TERNOCL_INT2_BITCOS=1): decode GEMVs read a
+// (2 - z)-bit/weight layout instead of int2; prefill keeps the int2 copy.
+// One uint32 buffer, three planes back to back (TernOCL common/bitcos.hpp):
+//   bitmap  [K/32][N]  bit c of word (kp, n) = weight(kp*32+c, n) != 0
+//   offsets [N]        first sign word of column n
+//   signs              one bit per non-zero, column-major in k, 1 -> -1
+// plus kBitcosPad words (the sign gather reads up to two words past a run), and
+// per local-K-slice count LS: slice_ranks [LS-1][N], the non-zeros of column n
+// above each boundary s*K/LS.
+constexpr size_t kBitcosPad = 4;
+constexpr int kBitcosLs[3] = {2, 4, 8};
+
+bool bitcos_enabled() {
+    static const bool v = std::getenv("OV_TERNOCL_INT2_BITCOS") != nullptr && kTernoclBitcosSource[0] != '\0';
+    return v;
+}
+
+struct BitcosHost {
+    std::vector<uint32_t> buf;
+    std::array<std::vector<uint32_t>, 3> sr;  // LS = 2, 4, 8
+    uint64_t nnz = 0;
+};
+
+BitcosHost pack_bitcos(const uint8_t* src, size_t N, size_t K, int32_t zp) {
+    BitcosHost b;
+    const size_t kw = K / 32, bw = kw * N;
+    std::vector<uint32_t> bmp(bw), nnz(N);
+    ov::parallel_for(N, [&](size_t n) {
+        uint32_t cnt = 0;
+        for (size_t kp = 0; kp < kw; ++kp) {
+            uint32_t w = 0;
+            for (size_t c = 0; c < 32; ++c)
+                w |= static_cast<uint32_t>(read_u2(src, n * K + kp * 32 + c) != zp) << c;
+            bmp[kp * N + n] = w;
+            cnt += static_cast<uint32_t>(__builtin_popcount(w));
+        }
+        nnz[n] = cnt;
+    });
+    std::vector<uint32_t> off(N);
+    size_t words = 0;
+    for (size_t n = 0; n < N; ++n) {
+        off[n] = static_cast<uint32_t>(words);
+        words += (nnz[n] + 31) / 32;
+        b.nnz += nnz[n];
+    }
+    OPENVINO_ASSERT(bw + N + words + kBitcosPad < (size_t{1} << 32), "[GPU] ternocl bitcos: layout exceeds 32-bit offsets");
+    b.buf.assign(bw + N + words + kBitcosPad, 0u);
+    std::copy(bmp.begin(), bmp.end(), b.buf.begin());
+    std::copy(off.begin(), off.end(), b.buf.begin() + bw);
+    uint32_t* signs = b.buf.data() + bw + N;
+    ov::parallel_for(N, [&](size_t n) {
+        uint32_t* sg = signs + off[n];
+        uint32_t rank = 0;
+        for (size_t k = 0; k < K; ++k) {
+            const int32_t code = static_cast<int32_t>(read_u2(src, n * K + k)) - zp;
+            OPENVINO_ASSERT(code >= -1 && code <= 1, "[GPU] ternocl bitcos: weight code ", code, " is not ternary");
+            if (code == 0)
+                continue;
+            sg[rank / 32] |= static_cast<uint32_t>(code < 0) << (rank % 32);
+            ++rank;
+        }
+    });
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t ls = static_cast<size_t>(kBitcosLs[i]);
+        if (K % (64 * ls) != 0)
+            continue;
+        auto& r = b.sr[i];
+        r.assign((ls - 1) * N, 0u);
+        const size_t slice_kw = K / ls / 32;
+        ov::parallel_for(N, [&](size_t n) {
+            uint32_t s = 0;
+            size_t kp = 0;
+            for (size_t sl = 1; sl < ls; ++sl) {
+                for (; kp < sl * slice_kw; ++kp)
+                    s += static_cast<uint32_t>(__builtin_popcount(bmp[kp * N + n]));
+                r[(sl - 1) * N + n] = s;
+            }
+        });
+    }
+    return b;
 }
 
 // The zero point carries whatever precision the model used, so read it by type.
@@ -159,6 +243,59 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
     return N <= 8192 ? GemvTile{32, 4, 2} : GemvTile{16, 2, 1};
 }
 
+// BITCOS GEMV tile (wgn, ls; u unused), per SGM.
+GemvTile bitcos_tile(size_t K, size_t N, int sgm) {
+    GemvTile t{0, 0, 0};
+    if (env_ints("OV_TERNOCL_INT2_BITCOS_TILE", &t.wgn, 2))  // "wgn,ls" for sweeps
+        return t;
+    struct Entry {
+        size_t k, n;
+        GemvTile t[4];  // SGM 1, 2, 4, 8
+    };
+    // Arc Pro B70, Bonsai 2 27B shapes, swept at M = 1 / 4 / 8 at z = 0.33 (SGM 2 uses the M = 4 tile).
+    static const Entry discrete[] = {
+        {5120, 34816, {{16, 8, 0}, {64, 8, 0}, {64, 8, 0}, {128, 8, 0}}},
+        {17408, 5120, {{32, 4, 0}, {64, 4, 0}, {64, 4, 0}, {32, 8, 0}}},
+        {5120, 16384, {{32, 4, 0}, {64, 8, 0}, {64, 8, 0}, {128, 8, 0}}},
+        {6144, 5120, {{32, 4, 0}, {64, 4, 0}, {64, 4, 0}, {32, 8, 0}}},
+        {5120, 14336, {{64, 2, 0}, {64, 8, 0}, {64, 8, 0}, {128, 8, 0}}},
+        {5120, 248320, {{32, 4, 0}, {64, 8, 0}, {64, 8, 0}, {64, 8, 0}}},
+    };
+    const int i = sgm == 1 ? 0 : (sgm == 2 ? 1 : (sgm == 4 ? 2 : 3));
+    for (const auto& e : discrete)
+        if (e.k == K && e.n == N)
+            t = e.t[i];
+    if (t.wgn == 0)
+        t = N <= 8192 ? GemvTile{32, 8, 0} : GemvTile{64, 4, 0};
+    while (t.ls > 1 && K % (64 * static_cast<size_t>(t.ls)) != 0)
+        t.ls /= 2;
+    return t;
+}
+
+// BITCOS M-tiled tile for M > 8: Arc Pro B70, Bonsai 2 27B shapes at z = 0.4,
+// swept at M = 20 (used up to M = 32) and M = 512 (above).
+MtTile bitcos_mt_tile(size_t K, size_t N, size_t M) {
+    MtTile t{0, 0, 0, 0};
+    if (env_ints("OV_TERNOCL_INT2_BITCOS_MT", &t.mt_m, 4))  // "mt_m,mt_n,wg_m,wg_n"
+        return t;
+    struct Entry {
+        size_t k, n;
+        MtTile prompt, bulk;
+    };
+    static const Entry table[] = {
+        {5120, 34816, {32, 32, 1, 4}, {32, 32, 4, 2}},
+        {17408, 5120, {16, 16, 2, 4}, {32, 32, 4, 4}},
+        {5120, 16384, {32, 16, 1, 4}, {32, 32, 4, 2}},
+        {6144, 5120, {16, 16, 2, 4}, {32, 32, 4, 2}},
+        {5120, 14336, {32, 16, 1, 4}, {32, 32, 2, 4}},
+        {5120, 248320, {32, 32, 1, 8}, {64, 16, 4, 2}},
+    };
+    for (const auto& e : table)
+        if (e.k == K && e.n == N)
+            return M <= 32 ? e.prompt : e.bulk;
+    return M <= 32 ? MtTile{32, 16, 1, 4} : MtTile{32, 32, 4, 2};
+}
+
 MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated) {
     MtTile t{0, 0, 0, 0};
     if (M < 64) {
@@ -261,6 +398,8 @@ struct TernoclInt2Packed {
     memory::ptr had_signs;  // i8 [K] +-1, or null
     memory::ptr had_input;  // f16 [rows, K] rotated activation
     size_t had_rows = 0;
+    memory::ptr bitcos;                    // BITCOS planes, when OV_TERNOCL_INT2_BITCOS is set
+    std::array<memory::ptr, 3> bitcos_sr;  // slice ranks for LS = 2, 4, 8
 };
 
 static std::mutex& ternocl_packed_mutex() {
@@ -296,6 +435,8 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
         MtTile t{};
     };
     std::array<Launch, 8> _launch;
+    std::array<Launch, 4> _bitcos_launch;     // GEMV, SGM 1, 2, 4, 8
+    std::array<Launch, 4> _bitcos_mt_launch;  // M-tiled, M <= 16, <= 32, < 64, >= 64
     kernel::ptr _fwht;
 
     fully_connected_ternocl_int2() : parent("ternocl_int2") {}
@@ -366,6 +507,39 @@ protected:
         return l;
     }
 
+    static int gemv_sgm(size_t M) {
+        return M == 1 ? 1 : (M == 2 ? 2 : (M <= 4 ? 4 : 8));
+    }
+
+    Launch& get_bitcos_launch(size_t M) {
+        const int sgm = gemv_sgm(M);
+        auto& l = _bitcos_launch[sgm == 1 ? 0 : (sgm == 2 ? 1 : (sgm == 4 ? 2 : 3))];
+        if (l.k)
+            return l;
+        l.g = bitcos_tile(_K, _N, sgm);
+        const std::string opts = "-cl-std=CL3.0 -DSGM=" + std::to_string(sgm) + " -DNSG_N=" +
+                                 std::to_string(l.g.wgn / 16) + " -DLS=" + std::to_string(l.g.ls) + epi_opts();
+        l.k = make_kernel(*_engine, get_program(*_engine, kTernoclBitcosSource, opts), "bitcos_fp16_upcvt_gemv");
+        if (std::getenv("OV_TERNOCL_INT2_CFG_DEBUG") != nullptr)
+            std::cerr << "[ternocl-bitcos] K=" << _K << " N=" << _N << " SGM " << sgm << ": " << opts << std::endl;
+        return l;
+    }
+
+    Launch& get_bitcos_mt_launch(size_t M) {
+        const int band = M <= 16 ? 0 : (M <= 32 ? 1 : (M < 64 ? 2 : 3));
+        auto& l = _bitcos_mt_launch[band];
+        if (l.k)
+            return l;
+        l.t = bitcos_mt_tile(_K, _N, M);
+        const std::string opts = "-cl-std=CL3.0 -DMT_M=" + std::to_string(l.t.mt_m) + " -DMT_N=" +
+                                 std::to_string(l.t.mt_n) + " -DWG_M=" + std::to_string(l.t.wg_m) + " -DWG_N=" +
+                                 std::to_string(l.t.wg_n) + " -cl-intel-256-GRF-per-thread" + epi_opts();
+        l.k = make_kernel(*_engine, get_program(*_engine, kTernoclBitcosSource, opts), "bitcos_fp16_upcvt_gemm_mt");
+        if (std::getenv("OV_TERNOCL_INT2_CFG_DEBUG") != nullptr)
+            std::cerr << "[ternocl-bitcos] K=" << _K << " N=" << _N << " M-band " << band << ": " << opts << std::endl;
+        return l;
+    }
+
     event::ptr execute_impl(const std::vector<event::ptr>& events,
                             typed_primitive_inst<fully_connected>& instance) override {
         auto& network = instance.get_network();
@@ -415,6 +589,47 @@ protected:
             in = pk->had_input;
         }
 
+        // Unused Other / Bias / slice-rank slots are never read, but need a valid buffer.
+        memory::cptr other = (_postop == 1 || _postop == 2) ? instance.dep_memory_ptr(_other_dep) : in;
+        memory::cptr bias = _postop == 3 ? instance.bias_memory() : in;
+        if (pk->bitcos) {
+            const bool mt = M > 8;
+            auto& l = mt ? get_bitcos_mt_launch(M) : get_bitcos_launch(M);
+            const size_t wgn = static_cast<size_t>(l.g.wgn), ls = static_cast<size_t>(l.g.ls);
+            memory::cptr sr = in;
+            if (!mt && ls > 1) {
+                sr = pk->bitcos_sr[ls == 2 ? 0 : (ls == 4 ? 1 : 2)];
+                OPENVINO_ASSERT(sr, "[GPU] ternocl bitcos: no slice ranks for LS=", ls);
+            }
+            kernel_arguments_desc d;
+            if (mt) {
+                const size_t tn = static_cast<size_t>(l.t.mt_n * l.t.wg_n), tm = static_cast<size_t>(l.t.mt_m * l.t.wg_m);
+                d.workGroups.local = {16 * static_cast<size_t>(l.t.wg_n * l.t.wg_m), 1, 1};
+                d.workGroups.global = {ceil_div(_N, tn) * d.workGroups.local[0], ceil_div(M, tm), 1};
+            } else {
+                d.workGroups.local = {wgn * ls, 1, 1};
+                d.workGroups.global = {ceil_div(_N, wgn) * wgn * ls, ceil_div(M, static_cast<size_t>(gemv_sgm(M))), 1};
+            }
+            // A, B, S, SR, C, Other, Bias, M, N, K
+            d.arguments = {{argument_desc::Types::INPUT, 0},  {argument_desc::Types::INPUT, 1},
+                           {argument_desc::Types::INPUT, 2},  {argument_desc::Types::INPUT, 3},
+                           {argument_desc::Types::OUTPUT, 0}, {argument_desc::Types::INPUT, 4},
+                           {argument_desc::Types::INPUT, 5},  {argument_desc::Types::SCALAR, 0},
+                           {argument_desc::Types::SCALAR, 1}, {argument_desc::Types::SCALAR, 2}};
+            scalars_desc sc(3);
+            for (auto& s : sc)
+                s.t = scalar_desc::Types::INT32;
+            sc[0].v.s32 = static_cast<int32_t>(M);
+            sc[1].v.s32 = static_cast<int32_t>(_N);
+            sc[2].v.s32 = static_cast<int32_t>(_K);
+            kernel_arguments_data a;
+            a.inputs = {in, pk->bitcos, pk->scales, sr, other, bias};
+            a.outputs = {instance.output_memory_ptr(0)};
+            a.scalars = &sc;
+            stream.set_arguments(*l.k, d, a);
+            return stream.enqueue_kernel(*l.k, d, a, deps, instance.is_output());
+        }
+
         auto& l = get_launch(M);
         kernel_arguments_desc d;
         if (M <= 8) {
@@ -439,9 +654,6 @@ protected:
         sc[0].v.s32 = static_cast<int32_t>(M);
         sc[1].v.s32 = static_cast<int32_t>(_N);
         sc[2].v.s32 = static_cast<int32_t>(_K);
-        // Unused Other / Bias slots are never read, but need a valid buffer.
-        memory::cptr other = (_postop == 1 || _postop == 2) ? instance.dep_memory_ptr(_other_dep) : in;
-        memory::cptr bias = _postop == 3 ? instance.bias_memory() : in;
         kernel_arguments_data a;
         a.inputs = {in, pk->weights, pk->scales, other, bias};
         a.outputs = {instance.output_memory_ptr(0)};
@@ -493,13 +705,33 @@ public:
                             " B is smaller than the dense ", N * K / 4, " B");
             std::vector<uint8_t> wei_host(wei_mem->size());
             wei_mem->copy_to(stream, wei_host.data(), true);
-            std::vector<uint32_t> packed((K / kTernoclPackFactor) * N);
-            pack_weights(wei_host.data(), packed.data(), N, K, zp);
-            own.weights = engine.allocate_memory(
-                layout{ov::PartialShape{static_cast<int64_t>(K / kTernoclPackFactor), static_cast<int64_t>(N)},
-                       data_types::i32, format::bfyx},
-                allocation_type::usm_device, false);
-            own.weights->copy_from(stream, packed.data(), true);
+
+            // One weight copy: BITCOS (decode GEMV + M-tiled prefill) or int2.
+            if (bitcos_enabled() && K % 64 == 0) {
+                const BitcosHost bh = pack_bitcos(wei_host.data(), N, K, zp);
+                auto upload = [&](const std::vector<uint32_t>& v) {
+                    auto m = engine.allocate_memory(
+                        layout{ov::PartialShape{static_cast<int64_t>(v.size())}, data_types::i32, format::bfyx},
+                        allocation_type::usm_device, false);
+                    m->copy_from(stream, v.data(), true);
+                    return m;
+                };
+                own.bitcos = upload(bh.buf);
+                for (size_t i = 0; i < 3; ++i)
+                    if (!bh.sr[i].empty())
+                        own.bitcos_sr[i] = upload(bh.sr[i]);
+                if (dbg)
+                    std::cerr << "[ternocl-bitcos] " << arg.id() << " z=" << 1.0 - static_cast<double>(bh.nnz) / (N * K)
+                              << " " << 32.0 * bh.buf.size() / (N * K) << " bits/weight" << std::endl;
+            } else {
+                std::vector<uint32_t> packed((K / kTernoclPackFactor) * N);
+                pack_weights(wei_host.data(), packed.data(), N, K, zp);
+                own.weights = engine.allocate_memory(
+                    layout{ov::PartialShape{static_cast<int64_t>(K / kTernoclPackFactor), static_cast<int64_t>(N)},
+                           data_types::i32, format::bfyx},
+                    allocation_type::usm_device, false);
+                own.weights->copy_from(stream, packed.data(), true);
+            }
 
             // OpenVINO keeps scales per output channel, [N, groups]; the kernel wants [groups, N].
             const size_t groups = K / kTernoclGroupSize;

@@ -68,10 +68,21 @@ file(READ "${TERNOCL_ROOT}/common/epilogue.clh" TERNOCL_EPILOGUE)
 file(READ "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl" TERNOCL_UPCVT)
 string(REPLACE "#include \"epilogue.clh\"" "${TERNOCL_EPILOGUE}" TERNOCL_UPCVT "${TERNOCL_UPCVT}")
 file(READ "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl" TERNOCL_FWHT)
+# BITCOS decode GEMV (experimental): optional, the impl falls back to int2 without it.
+set(TERNOCL_BITCOS_CL "${TERNOCL_ROOT}/bitcos_fp16_upcvt/bitcos_fp16_upcvt.cl")
+set(TERNOCL_BITCOS "")
+if(EXISTS "${TERNOCL_BITCOS_CL}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${TERNOCL_BITCOS_CL}")
+    file(READ "${TERNOCL_BITCOS_CL}" TERNOCL_BITCOS)
+    string(REPLACE "#include \"epilogue.clh\"" "${TERNOCL_EPILOGUE}" TERNOCL_BITCOS "${TERNOCL_BITCOS}")
+else()
+    message(STATUS "TernOCL: no bitcos_fp16_upcvt kernel in ${TERNOCL_ROOT}, BITCOS path disabled")
+endif()
 file(WRITE "${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc"
      "// Generated from ${TERNOCL_ROOT} by impls/ocl_v2/CMakeLists.txt; do not edit.\n#pragma once\n"
      "static const char kTernoclUpcvtSource[] = R\"TERNOCL(${TERNOCL_UPCVT})TERNOCL\";\n"
-     "static const char kTernoclFwhtSource[] = R\"TERNOCL(${TERNOCL_FWHT})TERNOCL\";\n")
+     "static const char kTernoclFwhtSource[] = R\"TERNOCL(${TERNOCL_FWHT})TERNOCL\";\n"
+     "static const char kTernoclBitcosSource[] = R\"TERNOCL(${TERNOCL_BITCOS})TERNOCL\";\n")
 configure_file("${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc" "${CODEGEN_INCDIR}/ternocl_int2_kernels.inc" COPYONLY)
 
 ov_gpu_add_backend_target(
