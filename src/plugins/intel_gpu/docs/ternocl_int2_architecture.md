@@ -201,7 +201,8 @@ launch class and build its kernels on first use:
 
 | M | Kernel | Tile |
 |---|---|---|
-| 1, 2, <= 4, <= 8 | up-convert GEMV, `SGM` = 1/2/4/8 | `gemv_tile(K, N)`: exact (K, N) entries, separate table for the integrated GPU |
+| 1 | up-convert GEMV, `SGM` = 1 | `gemv_tile(K, N)`: exact (K, N) entries, separate table for the integrated GPU |
+| 2..8 (MTP verify, M = k+1) | up-convert GEMV with `SGM` = 2/4/8, or M-tiled with an 8-row tile | `small_tile(K, N, M)`: exact (K, N, M) entries, B70 M = 2..8, Arc 140V M = 2..4; otherwise the M = 1 tile with the default `SGM` |
 | 9..16, 17..32, 33..63 | up-convert M-tiled | `mt_tile()`: one tile per M band and output width class (N <= 8192, < 65536, >= 65536), per GPU class |
 | >= 64 | up-convert M-tiled | `mt_tile()`: exact (K, N) entries, per GPU class |
 | > 8, with `OV_TERNOCL_INT2_INT8_PREFILL=1` | `quant_a` + `int2_int8_gemm_mt` | `int8_tile()`: exact (K, N) entries per M band (<= 16, <= 32, < 64, >= 64), default tile per band |
