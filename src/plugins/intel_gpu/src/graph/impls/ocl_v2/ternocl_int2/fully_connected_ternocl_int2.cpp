@@ -199,6 +199,56 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated, int bits) {
     return N <= 8192 ? GemvTile{32, 4, 1} : GemvTile{32, 2, 1};
 }
 
+// Small M (2..8: speculative-decoding verify steps, M = k + 1 for k drafts):
+// either the GEMV kernel with SGM rows per sub-group or the M-tiled kernel with
+// an 8-row tile. The M = 1 GEMV tiles do not carry over (SGM = 8 with them runs
+// at a quarter of the bandwidth), so each M has its own entry.
+struct SmallTile {
+    bool mt;
+    int sgm;
+    GemvTile g;
+    MtTile t;
+};
+
+int default_sgm(size_t M) {
+    return M == 1 ? 1 : (M == 2 ? 2 : (M <= 4 ? 4 : 8));
+}
+
+SmallTile small_tile(size_t K, size_t N, size_t M, bool integrated, int bits) {
+    SmallTile s{false, default_sgm(M), gemv_tile(K, N, integrated, bits), {}};
+    // The verify tiles below were swept for int2.
+    if (M == 1 || integrated || bits == 1 || std::getenv("OV_TERNOCL_INT2_GEMV") != nullptr)
+        return s;
+    struct Entry {
+        size_t k, n, m;
+        SmallTile s;
+    };
+#define G(sgm, wgn, ls, u) SmallTile{false, sgm, {wgn, ls, u}, {}}
+#define T(mm, mn, wm, wn) SmallTile{true, 0, {}, {mm, mn, wm, wn}}
+    // Arc Pro B70, TernOCL bench (>= 2 GiB rotating weights), all validated.
+    static const Entry table[] = {
+        {5120, 34816, 2, G(2, 64, 8, 1)},    {5120, 34816, 3, G(4, 128, 8, 1)},  {5120, 34816, 4, G(4, 64, 8, 1)},
+        {5120, 34816, 5, G(8, 128, 8, 1)},   {5120, 34816, 6, G(8, 128, 8, 1)},  {5120, 34816, 8, G(8, 16, 8, 1)},
+        {17408, 5120, 2, G(2, 64, 4, 1)},    {17408, 5120, 3, G(4, 64, 4, 2)},   {17408, 5120, 4, G(4, 64, 4, 2)},
+        {17408, 5120, 5, G(8, 128, 4, 1)},   {17408, 5120, 6, G(8, 128, 4, 1)},  {17408, 5120, 8, G(8, 128, 4, 1)},
+        {5120, 16384, 2, G(2, 128, 2, 1)},   {5120, 16384, 3, G(4, 64, 8, 1)},   {5120, 16384, 4, G(4, 128, 8, 1)},
+        {5120, 16384, 5, G(8, 128, 8, 1)},   {5120, 16384, 6, T(8, 16, 1, 8)},   {5120, 16384, 8, T(8, 16, 1, 2)},
+        {6144, 5120, 2, G(2, 64, 4, 1)},     {6144, 5120, 3, G(4, 64, 4, 1)},    {6144, 5120, 4, G(4, 128, 4, 1)},
+        {6144, 5120, 5, G(8, 128, 4, 1)},    {6144, 5120, 6, G(8, 128, 4, 1)},   {6144, 5120, 8, G(8, 128, 4, 1)},
+        {5120, 14336, 2, G(2, 64, 2, 2)},    {5120, 14336, 3, G(4, 128, 2, 1)},  {5120, 14336, 4, G(4, 64, 8, 1)},
+        {5120, 14336, 5, T(8, 16, 1, 2)},    {5120, 14336, 6, T(8, 16, 1, 2)},   {5120, 14336, 8, T(8, 16, 1, 2)},
+        {5120, 248320, 2, G(2, 32, 4, 1)},   {5120, 248320, 3, G(4, 16, 8, 1)},  {5120, 248320, 4, G(4, 16, 4, 1)},
+        {5120, 248320, 5, G(8, 16, 4, 1)},   {5120, 248320, 6, G(8, 16, 4, 1)},  {5120, 248320, 8, G(8, 16, 4, 1)},
+    };
+#undef G
+#undef T
+    const size_t m = M == 7 ? 8 : M;
+    for (const auto& e : table)
+        if (e.k == K && e.n == N && e.m == m)
+            return e.s;
+    return s;
+}
+
 MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated, int bits) {
     MtTile t{0, 0, 0, 0};
     if (M < 64) {
@@ -386,13 +436,16 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
     bool _integrated = false;
     int _bits = 2;
 
-    // GEMV for M = 1, 2, <= 4, <= 8; M-tiled for M <= 16, <= 32, < 64, >= 64.
+    // One launch per M = 1..8 (GEMV or 8-row M-tiled, see small_tile), then
+    // M-tiled for M <= 16, <= 32, < 64, >= 64.
     struct Launch {
         kernel::ptr k;
+        bool mt = false;
+        int sgm = 1;
         GemvTile g{};
         MtTile t{};
     };
-    std::array<Launch, 8> _launch;
+    std::array<Launch, 12> _launch;
     // int8 prefill, M-tiled classes 4..7: scale pre-kernel + GEMM from one program.
     struct Int8Launch {
         kernel::ptr quant, gemm;
@@ -467,8 +520,8 @@ protected:
 
     static size_t launch_class(size_t M) {
         if (M <= 8)
-            return M == 1 ? 0 : (M == 2 ? 1 : (M <= 4 ? 2 : 3));
-        return M <= 16 ? 4 : (M <= 32 ? 5 : (M < 64 ? 6 : 7));
+            return M - 1;
+        return M <= 16 ? 8 : (M <= 32 ? 9 : (M < 64 ? 10 : 11));
     }
 
     Launch& get_launch(size_t M) {
@@ -478,13 +531,20 @@ protected:
         std::string opts = "-cl-std=CL3.0";
         const char* src = _bits == 1 ? kTernoclInt1Source : kTernoclUpcvtSource;
         if (M <= 8) {
-            const int sgm = M == 1 ? 1 : (M == 2 ? 2 : (M <= 4 ? 4 : 8));
-            l.g = gemv_tile(_K, _N, _integrated, _bits);
-            opts += " -DSGM=" + std::to_string(sgm) + " -DNSG_N=" + std::to_string(l.g.wgn / 16) + " -DLS=" + std::to_string(l.g.ls) +
+            const SmallTile s = small_tile(_K, _N, M, _integrated, _bits);
+            l.mt = s.mt;
+            l.sgm = s.sgm;
+            l.g = s.g;
+            l.t = s.t;
+        } else {
+            l.mt = true;
+            l.t = mt_tile(_K, _N, M, _integrated, _bits);
+        }
+        if (!l.mt) {
+            opts += " -DSGM=" + std::to_string(l.sgm) + " -DNSG_N=" + std::to_string(l.g.wgn / 16) + " -DLS=" + std::to_string(l.g.ls) +
                     " -DU=" + std::to_string(l.g.u) + " -DPF=0";
             l.k = make_kernel(*_engine, get_program(*_engine, src, opts + epi_opts()), _bits == 1 ? "int1_fp16_upcvt_gemm" : "int2_fp16_upcvt_gemm");
         } else {
-            l.t = mt_tile(_K, _N, M, _integrated, _bits);
             opts += " -DMT_M=" + std::to_string(l.t.mt_m) + " -DMT_N=" + std::to_string(l.t.mt_n) + " -DWG_M=" + std::to_string(l.t.wg_m) +
                     " -DWG_N=" + std::to_string(l.t.wg_n) + " -cl-intel-256-GRF-per-thread";
             l.k = make_kernel(*_engine, get_program(*_engine, src, opts + epi_opts()), _bits == 1 ? "int1_fp16_upcvt_gemm_mt" : "int2_fp16_upcvt_gemm_mt");
@@ -495,7 +555,7 @@ protected:
     }
 
     Int8Launch& get_int8_launch(size_t M) {
-        auto& l = _int8_launch[launch_class(M) - 4];
+        auto& l = _int8_launch[launch_class(M) - 8];
         if (l.gemm)
             return l;
         l.t = int8_tile(_K, _N, M);
@@ -619,8 +679,8 @@ protected:
 
         auto& l = get_launch(M);
         kernel_arguments_desc d;
-        if (M <= 8) {
-            const size_t sgm = M == 1 ? 1 : (M == 2 ? 2 : (M <= 4 ? 4 : 8));
+        if (!l.mt) {
+            const size_t sgm = static_cast<size_t>(l.sgm);
             const size_t wgn = static_cast<size_t>(l.g.wgn);
             d.workGroups.local = {wgn * static_cast<size_t>(l.g.ls), 1, 1};
             d.workGroups.global = {ceil_div(_N, wgn) * d.workGroups.local[0], ceil_div(M, sgm), 1};
