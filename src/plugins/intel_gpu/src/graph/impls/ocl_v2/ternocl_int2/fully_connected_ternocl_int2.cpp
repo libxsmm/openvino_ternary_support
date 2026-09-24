@@ -159,12 +159,23 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
     return N <= 8192 ? GemvTile{32, 4, 2} : GemvTile{16, 2, 1};
 }
 
-MtTile mt_tile(size_t K, size_t N, size_t M) {
+MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated) {
     MtTile t{0, 0, 0, 0};
     if (M < 64) {
         if (env_ints("OV_TERNOCL_INT2_MID", &t.mt_m, 4))  // "mt_m,mt_n,wg_m,wg_n"
             return t;
-        return M <= 16 ? MtTile{16, 32, 1, 8} : MtTile{32, 32, 1, 8};
+        // Sweep at M = 12 / 20 / 32 / 48 over the 27B shapes; the winners group
+        // by output width (narrow N <= 8192, head N >= 65536).
+        const int band = M <= 16 ? 0 : (M <= 32 ? 1 : 2);
+        static const MtTile narrow[3] = {{16, 16, 2, 2}, {32, 16, 2, 4}, {32, 16, 1, 4}};  // Arc Pro B70
+        static const MtTile wide[3] = {{16, 16, 1, 8}, {32, 16, 1, 4}, {64, 16, 1, 8}};
+        static const MtTile head[3] = {{16, 16, 1, 4}, {64, 32, 1, 8}, {64, 32, 1, 8}};
+        static const MtTile i_narrow[3] = {{16, 32, 1, 4}, {32, 32, 1, 8}, {64, 32, 1, 8}};  // Arc 140V
+        static const MtTile i_wide[3] = {{16, 16, 1, 8}, {64, 32, 1, 4}, {64, 32, 1, 4}};
+        static const MtTile i_head[3] = {{16, 16, 1, 4}, {32, 16, 1, 8}, {64, 32, 1, 4}};
+        if (integrated)
+            return N <= 8192 ? i_narrow[band] : (N >= 65536 ? i_head[band] : i_wide[band]);
+        return N <= 8192 ? narrow[band] : (N >= 65536 ? head[band] : wide[band]);
     }
     if (env_ints("OV_TERNOCL_INT2_MT", &t.mt_m, 4))
         return t;
@@ -263,13 +274,13 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
     size_t _had_block = 0;
     bool _integrated = false;
 
-    // GEMV for M = 1, 2, <= 4, <= 8; M-tiled for 8 < M <= 16, < 64, >= 64.
+    // GEMV for M = 1, 2, <= 4, <= 8; M-tiled for M <= 16, <= 32, < 64, >= 64.
     struct Launch {
         kernel::ptr k;
         GemvTile g{};
         MtTile t{};
     };
-    std::array<Launch, 7> _launch;
+    std::array<Launch, 8> _launch;
     kernel::ptr _fwht;
 
     fully_connected_ternocl_int2() : parent("ternocl_int2") {}
@@ -311,7 +322,7 @@ protected:
     static size_t launch_class(size_t M) {
         if (M <= 8)
             return M == 1 ? 0 : (M == 2 ? 1 : (M <= 4 ? 2 : 3));
-        return M <= 16 ? 4 : (M < 64 ? 5 : 6);
+        return M <= 16 ? 4 : (M <= 32 ? 5 : (M < 64 ? 6 : 7));
     }
 
     Launch& get_launch(size_t M) {
@@ -327,7 +338,7 @@ protected:
             l.k = make_kernel(*_engine, get_program(*_engine, kTernoclUpcvtSource, opts + epi_opts()),
                               "int2_fp16_upcvt_gemm");
         } else {
-            l.t = mt_tile(_K, _N, M);
+            l.t = mt_tile(_K, _N, M, _integrated);
             opts += " -DMT_M=" + std::to_string(l.t.mt_m) + " -DMT_N=" + std::to_string(l.t.mt_n) +
                     " -DWG_M=" + std::to_string(l.t.wg_m) + " -DWG_N=" + std::to_string(l.t.wg_n) +
                     " -cl-intel-256-GRF-per-thread";

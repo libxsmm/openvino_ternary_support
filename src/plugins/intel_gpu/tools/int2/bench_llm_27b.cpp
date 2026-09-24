@@ -107,8 +107,8 @@ int main(int argc, char** argv) {
         for (const auto& node : lm.get_runtime_model()->get_ordered_ops()) {
             const auto& rt = node->get_rt_info();
             const auto it = rt.find("primitiveType");
-            if (it != rt.end() && it->second.as<std::string>().find("sycl_kernel") != std::string::npos) {
-                std::cout << "xetla impl in use (first hit: " << node->get_friendly_name() << ")\n";
+            if (it != rt.end() && it->second.as<std::string>().find("ternocl_int2") != std::string::npos) {
+                std::cout << "ternocl int2 impl in use (first hit: " << node->get_friendly_name() << ")\n";
                 break;
             }
         }

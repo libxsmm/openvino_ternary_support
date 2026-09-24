@@ -43,13 +43,14 @@ add_custom_command(OUTPUT "${CODEGEN_INCDIR}/${KERNEL_SOURCES}"
 
 add_custom_target(run_ocl_codegen ALL DEPENDS "${CODEGEN_INCDIR}/${KERNEL_SOURCES}")
 
-# TernOCL int2 kernels (ternocl_int2/), embedded as source strings. TERNOCL_ROOT
-# defaults to a TernOCL checkout next to the OpenVINO tree.
+# TernOCL int2 kernels (ternocl_int2/), embedded as source strings. They come from
+# the thirdparty/TernOCL submodule (github.com/libxsmm/TernOCL); TERNOCL_ROOT
+# (cache or environment) points at another checkout, e.g. while editing kernels.
 if(NOT DEFINED TERNOCL_ROOT)
     if(DEFINED ENV{TERNOCL_ROOT})
         set(TERNOCL_ROOT "$ENV{TERNOCL_ROOT}")
     else()
-        get_filename_component(TERNOCL_ROOT "${OpenVINO_SOURCE_DIR}/../TernOCL" ABSOLUTE)
+        set(TERNOCL_ROOT "${MAIN_DIR}/thirdparty/TernOCL")
     endif()
 endif()
 set(TERNOCL_ROOT "${TERNOCL_ROOT}" CACHE PATH "TernOCL kernel collection used by the int2 FullyConnected impl")
@@ -58,7 +59,8 @@ set(TERNOCL_FILES "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl"
                   "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl")
 foreach(f IN LISTS TERNOCL_FILES)
     if(NOT EXISTS "${f}")
-        message(FATAL_ERROR "TernOCL kernel ${f} not found; set TERNOCL_ROOT to the TernOCL checkout")
+        message(FATAL_ERROR "TernOCL kernel ${f} not found: run `git submodule update --init "
+                            "src/plugins/intel_gpu/thirdparty/TernOCL` or set TERNOCL_ROOT")
     endif()
 endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TERNOCL_FILES})

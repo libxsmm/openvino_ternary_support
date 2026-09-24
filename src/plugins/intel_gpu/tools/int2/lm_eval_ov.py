@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lm-evaluation-harness on the OpenVINO GPU plugin (XeTLA int2) through
+"""lm-evaluation-harness on the OpenVINO GPU plugin (TernOCL int2) through
 paged_serve_llm_27b: every generate_until batch is written as token ids to a
 request file, served with continuous batching, and read back.
 
