@@ -96,7 +96,34 @@ plugin; wall 50.3 min against XeTLA's 89.8 min (129 tok/s aggregate decode;
 the 1200-1370-token 8-shot prefills and the M = 16 joint decode steps run on the
 M-tiled kernels).
 
+## 5b. MTP speculative decoding
+
+Port of the vLLM/XeTLA MTP work (`xetla_vllm_plugin` `feature/bonsai2-mtp`) on
+branch `feature_integrate_2bit_ocl_kernels_mtp` (details in build_and_run 7.4):
+
+* Draft IR (`bonsai2_mtp_to_ir.py`): the ProCreations head grafted onto layer 3
+  of the Bonsai 2 IR (dense fp16 or int8 weights, rotations removed), sharing
+  the target's u2 `lm_head`; the Hadamard sign vector is folded into its norms.
+* Rollback of the GDN/conv1d state with the paged ops' existing
+  `cache_interval` (= 1): no kernel changes were needed.
+* Verify-step (M = k+1) GEMV tiles swept per shape with TernOCL's bench on the
+  B70 (M = 2..8) and Arc 140V (M = 2..4), all validated; the M = 1 tiles with
+  a larger `SGM` ran at up to a quarter of the bandwidth.
+
+| | plain | MTP k=3 | vLLM + XeTLA MTP k=3 |
+|---|---|---|---|
+| B70, batch 1 (tok/s) | 42.7 | **72.0** (x1.69) | 80.2 (x1.73 over 46.2) |
+| Arc 140V, batch 1 (tok/s) | 11.4 | **21.4** (x1.88) | 11.06 |
+| GSM8K 1319, B70 | 96.89% (batch 8) | **96.89%** (batch 8, 41.8 min) | 97.7% (300 examples) |
+
+Per k=3 round on the B70: verify 25 ms GPU time (M = 4), 3 draft steps of
+1.6 ms GPU time each (the int8 head at ~510 GB/s); the remaining ~11 ms are
+per-inference host overhead of the ~1500-primitive graph, the main lever left.
+
 ## 6. Not done / open
+
+* MTP: host overhead per inference (above); no adaptive k (MTP loses at
+  batch 16); draft `lm_head` is a second copy of the target's.
 
 * LNL tiles: prompt-length (M = 12..48) and M >= 64 (swept at M = 512) are
   tuned; LNL decode GEMV tiles exist only for the 27B shapes.

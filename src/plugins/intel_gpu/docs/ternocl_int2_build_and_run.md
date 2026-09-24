@@ -383,6 +383,60 @@ The model card's math group is 96.57. The serving run is prefill-heavy (every
 request is an 8-shot prompt of 1200-1370 tokens, and the joint decode step runs at
 M = batch), which is where the M-tiled TernOCL kernels are fastest.
 
+### 7.4 MTP speculative decoding
+
+The ProCreations MTP head for Bonsai 2 27B
+([ProCreations/Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP),
+`model_mtp.safetensors`: one Qwen3.5 full-attention layer + `fc` + norms)
+becomes a draft IR that reuses a full-attention layer of the target IR and the
+target's u2 `lm_head`:
+
+```bash
+python tools/int2/bonsai2_mtp_to_ir.py --ir bonsai2-27b-u2/openvino_model.xml \
+    --mtp Ternary-Bonsai-2-27B-MTP/model_mtp.safetensors \
+    --gguf Ternary-Bonsai-2-27B-PQ2_0.gguf --gguf-py llama.cpp-prism/gguf-py \
+    --weights i8 --out bonsai2-27b-u2/openvino_mtp_i8_model.xml
+```
+
+The draft input is `[embed(t+1) | h_t]` with `h_t` the target's post-final-norm
+hidden state (the input of its `lm_head` rotation, exposed as an extra output
+at load time); the Hadamard sign vector folded into that norm is folded into
+the draft's `pre_fc_norm_hidden` and `mtp.norm` (read from the GGUF).
+`--weights i8` stores the head as int8 with per-128 fp16 scales.
+
+Both `paged_bench_llm_27b` and `paged_serve_llm_27b` run the draft/verify loop
+with `BENCH_MTP=<draft xml>` and `BENCH_MTP_K=<k>` (default 3): k draft steps,
+one target step over the k+1 tokens, greedy acceptance, bonus token. The
+linear-attention state is rolled back through the paged ops' `cache_interval`:
+with `la.cache_interval = 1` the GDN and conv1d kernels write the state after
+token t to `la.block_indices[begin + 1 + t]`, so each sequence keeps k+2 state
+slots and continues from the slot of its last accepted token. Rejected
+full-attention KV entries are simply overwritten. The verify steps run M = k+1
+GEMVs, which have their own tiles (section 6 of the architecture doc).
+
+Bonsai 2 27B, greedy, int8 draft (`BENCH_NO_EOS=1`, photosynthesis prompt):
+
+| | plain | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|---|
+| Arc Pro B70, 256 tokens (tok/s) | 42.7 | 62.9 | 66.8 | **72.0** | 67.3 |
+| acceptance | | 88% | 76% | 66% | 55% |
+| Arc 140V (LNL), 128 tokens (tok/s) | 11.4 | 14.4 | 16.8 | **21.4** | |
+
+Generation is identical to plain decode (k=2, k=3 over all 256 tokens; k=1, k=4
+take a near-tie fork at token 148). Serving 64 GSM8K prompts on the B70
+(acceptance 83%, 3.5 tokens per round):
+
+| batch | plain (tok/s) | MTP k=3 (tok/s) |
+|---|---|---|
+| 1 | 36.7 | 65.5 (x1.78) |
+| 8 | 116.9 | 145.3 (x1.24) |
+| 16 | 135.3 | 126.1 (x0.93) |
+
+Full GSM8K with MTP k=3, batch 8 (`BENCH_MTP=... BENCH_MTP_K=3 BATCH=8
+run_lm_eval_ov.sh ...`): **96.89%**, 41.8 min, 84.4% acceptance -- the same
+score as without MTP. Above batch 8 the k+1-row verify steps cost more than
+they save; use plain decode there.
+
 ---
 
 ## 8. Verifying correctness
@@ -431,3 +485,6 @@ Benchmark tool:
 | `BENCH_PROFILE=1` | Per-op profile of one decode step, with call counts |
 | `BENCH_NO_EOS=1` | Keep decoding past EOS so every run does equal work |
 | `BENCH_DUMP_LOGITS=<step>:<path>` | Dump raw f32 logits at a decode step |
+| `BENCH_MTP=<draft xml>` | MTP speculative decoding with that draft (bench and serve, section 7.4) |
+| `BENCH_MTP_K=<k>` | Draft tokens per round (default 3) |
+| `BENCH_MTP_DEBUG=1` | Per-round draft/accept trace (bench) |

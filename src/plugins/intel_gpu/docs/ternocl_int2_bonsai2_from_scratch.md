@@ -237,6 +237,25 @@ srun --jobid=$JOB --overlap env OV_TERNOCL_INT2_MERGE_MLP=1 \
 thinking, up to 4096 generated tokens): 50 min on the B70, `exact_match 0.968`
 (1277/1319). First 100: ~0.96-0.98 depending on the slice.
 
+### 5.4 MTP speculative decoding (optional)
+
+```bash
+hf download ProCreations/Ternary-Bonsai-2-27B-MTP model_mtp.safetensors --local-dir bonsai2-mtp
+$WORK/venv/bin/pip install safetensors torch --index-url https://download.pytorch.org/whl/cpu
+$WORK/venv/bin/python $TOOLS/bonsai2_mtp_to_ir.py \
+    --ir $WORK/bonsai2-27b-u2/openvino_model.xml --mtp bonsai2-mtp/model_mtp.safetensors \
+    --gguf bonsai2-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf --gguf-py llama.cpp-prism/gguf-py \
+    --weights i8 --out $WORK/bonsai2-27b-u2/openvino_mtp_i8_model.xml
+# expected: "[mtp] draft: 513 ops ..." and a ~770 MB .bin
+
+# bench / serve / run_lm_eval_ov.sh all take the draft from the environment
+export BENCH_MTP=$WORK/bonsai2-27b-u2/openvino_mtp_i8_model.xml BENCH_MTP_K=3
+```
+
+Expected on the B70 with the 5.1 command: 72 tok/s at k=3 (plain 42.7), with the
+same generated ids; on the Arc 140V 21.4 tok/s (plain 11.4). Keep batch <= 8
+when serving with MTP.
+
 ## 6. Knobs that matter
 
 | Variable | Default | Effect |

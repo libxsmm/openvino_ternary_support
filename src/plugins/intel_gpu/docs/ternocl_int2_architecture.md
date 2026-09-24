@@ -159,7 +159,8 @@ as the SYCL kernel it replaces, so the rotated activation is bit-identical.
 
 | M | Kernel | Tile |
 |---|---|---|
-| 1, 2, <= 4, <= 8 | GEMV, `SGM` = 1/2/4/8 | `gemv_tile(K, N)`: exact (K, N) entries, separate table for the integrated GPU |
+| 1 | GEMV, `SGM` = 1 | `gemv_tile(K, N)`: exact (K, N) entries, separate table for the integrated GPU |
+| 2..8 (MTP verify, M = k+1) | GEMV with `SGM` = 2/4/8, or M-tiled with an 8-row tile | `small_tile(K, N, M)`: exact (K, N, M) entries, B70 M = 2..8, Arc 140V M = 2..4; otherwise the M = 1 tile with the default `SGM` |
 | 9..16, 17..32, 33..63 | M-tiled | `mt_tile()`: one tile per M band and output width class (N <= 8192, < 65536, >= 65536), per GPU class |
 | >= 64 | M-tiled | `mt_tile()`: exact (K, N) entries tuned at M = 1024 (B70) / 512 (Arc 140V) |
 
