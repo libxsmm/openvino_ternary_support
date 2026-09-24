@@ -197,6 +197,21 @@ MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated) {
         {5120, 14336, {64, 32, 4, 4}},
         {5120, 248320, {128, 16, 2, 4}},
     };
+    // Arc 140V (Lunar Lake), M = 512.
+    static const Entry igpu[] = {
+        {5120, 34816, {128, 16, 2, 2}},
+        {17408, 5120, {64, 32, 4, 2}},
+        {5120, 16384, {128, 16, 2, 4}},
+        {6144, 5120, {128, 16, 2, 4}},
+        {5120, 14336, {128, 16, 2, 4}},
+        {5120, 248320, {128, 16, 2, 2}},
+    };
+    if (integrated) {
+        for (const auto& e : igpu)
+            if (e.k == K && e.n == N)
+                return e.t;
+        return MtTile{128, 16, 2, 4};
+    }
     for (const auto& e : table)
         if (e.k == K && e.n == N)
             return e.t;

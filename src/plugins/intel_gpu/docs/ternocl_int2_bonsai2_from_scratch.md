@@ -11,9 +11,10 @@ Numbers you should reproduce (256 tokens, greedy, photosynthesis prompt, second 
 | GPU | decode | TTFT (20-token prompt) |
 |---|---|---|
 | Arc Pro B70 | 42.8 tok/s | 86 ms |
-| Arc 140V (Lunar Lake) | 8.7 tok/s | 290 ms |
+| Arc 140V (Lunar Lake) | 8.1–8.7 tok/s | 240 ms |
 
-GSM8K (1319, 8-shot, thinking `medium`) on the B70: see section 5.3.
+GSM8K (1319, 8-shot, thinking `medium`): 96.8% on the B70 in 50 min, the same
+score as the XeTLA branch (96.8%, 90 min) and the vLLM plugin (96.7%).
 
 ---
 
@@ -210,8 +211,8 @@ runs: 43.1 tok/s, TTFT 127 ms.
 Same binary, same command, `JOB` from the `lnl` partition. Expected (second run):
 
 ```
-TTFT (prefill) : 290 ms
-decode         : 255 tokens in 29.2 s = 8.7 tok/s
+TTFT (prefill) : 240 ms
+decode         : 255 tokens in 29-32 s = 8.1-8.7 tok/s
 ```
 
 (XeTLA branch, same session: 8.0 tok/s, TTFT 627 ms.) LNL decode varies by a
@@ -233,7 +234,8 @@ srun --jobid=$JOB --overlap env OV_TERNOCL_INT2_MERGE_MLP=1 \
 
 `run_lm_eval_ov.sh <jobid> <tag>` wraps the same call (`LIMIT`, `BATCH`,
 `THINK`, `TASKS`, `OV_BIN`, `SERVE`, `GPU`). Full test set (1319 examples,
-thinking, up to 4096 generated tokens): @@GSM8K@@
+thinking, up to 4096 generated tokens): 50 min on the B70, `exact_match 0.968`
+(1277/1319). First 100: ~0.96-0.98 depending on the slice.
 
 ## 6. Knobs that matter
 

@@ -78,7 +78,7 @@ and 620 ms TTFT against XeTLA's 43.1 / 131 ms. In order:
 | | TernOCL decode | TernOCL TTFT | XeTLA decode | XeTLA TTFT |
 |---|---|---|---|---|
 | Arc Pro B70 (same GPU, alternating runs) | 42.6-42.8 tok/s | 86-91 ms | 43.1-43.2 tok/s | 125-129 ms |
-| Arc 140V (Lunar Lake) | 8.72 tok/s | 291 ms | 7.96 tok/s | 627 ms |
+| Arc 140V (Lunar Lake), LNL tile tables | 8.1-8.7 tok/s | 240 ms | 7.96 tok/s | 627 ms |
 
 Across two different B70 cards of the same host the spread is ~3%, larger
 than the TernOCL/XeTLA decode difference; compare on one card.
@@ -87,12 +87,19 @@ Output: token ids identical to the XeTLA branch for the first 135 tokens,
 then the near-tie fork at token 136 that XeTLA's own variants already show;
 decoded text is the expected essay in both. Both branches are deterministic.
 
-@@GSM8K@@
+## 5a. Harness check
+
+lm-evaluation-harness GSM8K (1319, `gsm8k_cot_llama` 8-shot, thinking medium,
+greedy) through `paged_serve_llm_27b`, batch 16, B70: **96.82%** (1277/1319),
+identical to the XeTLA branch (96.8%, 1277/1319) and 0.1 above the vLLM
+plugin; wall 50.3 min against XeTLA's 89.8 min (129 tok/s aggregate decode;
+the 1200-1370-token 8-shot prefills and the M = 16 joint decode steps run on the
+M-tiled kernels).
 
 ## 6. Not done / open
 
-* LNL M-tiled tiles (M >= 64) still use the B70 table; the LNL mid-M sweep
-  results are in TernOCL `int2_fp16_upcvt/results/midm/lnl_*`.
+* LNL tiles: prompt-length (M = 12..48) and M >= 64 (swept at M = 512) are
+  tuned; LNL decode GEMV tiles exist only for the 27B shapes.
 * Only the up-convert kernels are wired in. TernOCL's int2 x int8 DPAS kernels
   (upfront or fused activation quantization) are faster for long prefills and
   could back a `dpas_prefill` mode as in the XeTLA branch.

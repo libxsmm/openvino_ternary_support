@@ -280,7 +280,7 @@ measured in the same session on the same GPU:
 | GPU | TernOCL decode | TernOCL TTFT | XeTLA decode | XeTLA TTFT |
 |---|---|---|---|---|
 | Arc Pro B70 | 42.8 tok/s | 86 ms | 43.1 tok/s | 127 ms |
-| Arc 140V (Lunar Lake) | 8.7 tok/s | 291 ms | 8.0 tok/s | 627 ms |
+| Arc 140V (Lunar Lake) | 8.1-8.7 tok/s | 240 ms | 8.0 tok/s | 627 ms |
 
 On the B70 decode is at parity (the GEMVs are within a few percent of XeTLA's
 and the rest of the step is identical); prefill is 1.5x faster from the tuned
@@ -370,7 +370,18 @@ The paged linear-attention ops always start from the state in
 The server clears a slot's state blocks on every refill; single-sequence
 benchmarks never hit this.
 
-@@GSM8K@@
+Bonsai 2 27B, GSM8K test set (1319), `gsm8k_cot_llama` 8-shot, thinking
+`medium`, greedy, Arc Pro B70, batch 16, same protocol on all three:
+
+| | exact match | wall (1319 examples) |
+|---|---|---|
+| OpenVINO + TernOCL int2 | **96.8%** (1277/1319) | 50.3 min |
+| OpenVINO + XeTLA int2 | 96.8% (1277/1319) | 89.8 min |
+| vLLM + XeTLA int2 | 96.7% (1276/1319) | 90.5 min |
+
+The model card's math group is 96.57. The serving run is prefill-heavy (every
+request is an 8-shot prompt of 1200-1370 tokens, and the joint decode step runs at
+M = batch), which is where the M-tiled TernOCL kernels are fastest.
 
 ---
 

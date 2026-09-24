@@ -160,8 +160,8 @@ as the SYCL kernel it replaces, so the rotated activation is bit-identical.
 | M | Kernel | Tile |
 |---|---|---|
 | 1, 2, <= 4, <= 8 | GEMV, `SGM` = 1/2/4/8 | `gemv_tile(K, N)`: exact (K, N) entries, separate table for the integrated GPU |
-| 9..16, 17..32, 33..63 | M-tiled | `mt_tile()`: one tile per M band and output width class (N <= 8192, < 65536, >= 65536) |
-| >= 64 | M-tiled | `mt_tile()`: exact (K, N) entries tuned at M = 1024 |
+| 9..16, 17..32, 33..63 | M-tiled | `mt_tile()`: one tile per M band and output width class (N <= 8192, < 65536, >= 65536), per GPU class |
+| >= 64 | M-tiled | `mt_tile()`: exact (K, N) entries tuned at M = 1024 (B70) / 512 (Arc 140V) |
 
 Tuned on an Arc Pro B70 with TernOCL's `bench.sh` / `sweep_midm.sh` (>= 2 GiB of
 rotating distinct weights, median of 3, device-event time), for the Bonsai 8B
