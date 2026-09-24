@@ -176,7 +176,7 @@ int default_sgm(size_t M) {
 
 SmallTile small_tile(size_t K, size_t N, size_t M, bool integrated) {
     SmallTile s{false, default_sgm(M), gemv_tile(K, N, integrated), {}};
-    if (M == 1 || integrated || std::getenv("OV_TERNOCL_INT2_GEMV") != nullptr)
+    if (M == 1 || std::getenv("OV_TERNOCL_INT2_GEMV") != nullptr)
         return s;
     struct Entry {
         size_t k, n, m;
@@ -199,9 +199,24 @@ SmallTile small_tile(size_t K, size_t N, size_t M, bool integrated) {
         {5120, 248320, 2, G(2, 32, 4, 1)},   {5120, 248320, 3, G(4, 16, 8, 1)},  {5120, 248320, 4, G(4, 16, 4, 1)},
         {5120, 248320, 5, G(8, 16, 4, 1)},   {5120, 248320, 6, G(8, 16, 4, 1)},  {5120, 248320, 8, G(8, 16, 4, 1)},
     };
+    // Arc 140V (Lunar Lake), M = 2..4 (larger M keeps the M = 1 tile).
+    static const Entry igpu[] = {
+        {5120, 34816, 2, G(2, 64, 4, 1)},   {5120, 34816, 3, G(4, 16, 4, 1)},   {5120, 34816, 4, G(4, 16, 4, 1)},
+        {17408, 5120, 2, G(2, 64, 8, 1)},   {17408, 5120, 3, G(4, 64, 8, 1)},   {17408, 5120, 4, G(4, 32, 8, 1)},
+        {5120, 16384, 2, G(2, 64, 1, 1)},   {5120, 16384, 3, G(4, 16, 4, 1)},   {5120, 16384, 4, G(4, 32, 4, 1)},
+        {6144, 5120, 2, G(2, 16, 8, 1)},    {6144, 5120, 3, G(4, 16, 8, 1)},    {6144, 5120, 4, G(4, 16, 8, 1)},
+        {5120, 14336, 2, G(2, 64, 4, 1)},   {5120, 14336, 3, G(4, 16, 4, 1)},   {5120, 14336, 4, G(4, 16, 4, 1)},
+        {5120, 248320, 2, G(2, 128, 2, 1)}, {5120, 248320, 3, G(4, 64, 2, 2)},  {5120, 248320, 4, G(4, 32, 2, 2)},
+    };
 #undef G
 #undef T
     const size_t m = M == 7 ? 8 : M;
+    if (integrated) {
+        for (const auto& e : igpu)
+            if (e.k == K && e.n == N && e.m == m)
+                return e.s;
+        return s;
+    }
     for (const auto& e : table)
         if (e.k == K && e.n == N && e.m == m)
             return e.s;
