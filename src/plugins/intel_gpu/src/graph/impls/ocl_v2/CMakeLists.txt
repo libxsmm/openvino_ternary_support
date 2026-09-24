@@ -43,6 +43,35 @@ add_custom_command(OUTPUT "${CODEGEN_INCDIR}/${KERNEL_SOURCES}"
 
 add_custom_target(run_ocl_codegen ALL DEPENDS "${CODEGEN_INCDIR}/${KERNEL_SOURCES}")
 
+# TernOCL int2 kernels (ternocl_int2/), embedded as source strings. TERNOCL_ROOT
+# defaults to a TernOCL checkout next to the OpenVINO tree.
+if(NOT DEFINED TERNOCL_ROOT)
+    if(DEFINED ENV{TERNOCL_ROOT})
+        set(TERNOCL_ROOT "$ENV{TERNOCL_ROOT}")
+    else()
+        get_filename_component(TERNOCL_ROOT "${OpenVINO_SOURCE_DIR}/../TernOCL" ABSOLUTE)
+    endif()
+endif()
+set(TERNOCL_ROOT "${TERNOCL_ROOT}" CACHE PATH "TernOCL kernel collection used by the int2 FullyConnected impl")
+set(TERNOCL_FILES "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl"
+                  "${TERNOCL_ROOT}/common/epilogue.clh"
+                  "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl")
+foreach(f IN LISTS TERNOCL_FILES)
+    if(NOT EXISTS "${f}")
+        message(FATAL_ERROR "TernOCL kernel ${f} not found; set TERNOCL_ROOT to the TernOCL checkout")
+    endif()
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TERNOCL_FILES})
+file(READ "${TERNOCL_ROOT}/common/epilogue.clh" TERNOCL_EPILOGUE)
+file(READ "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl" TERNOCL_UPCVT)
+string(REPLACE "#include \"epilogue.clh\"" "${TERNOCL_EPILOGUE}" TERNOCL_UPCVT "${TERNOCL_UPCVT}")
+file(READ "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl" TERNOCL_FWHT)
+file(WRITE "${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc"
+     "// Generated from ${TERNOCL_ROOT} by impls/ocl_v2/CMakeLists.txt; do not edit.\n#pragma once\n"
+     "static const char kTernoclUpcvtSource[] = R\"TERNOCL(${TERNOCL_UPCVT})TERNOCL\";\n"
+     "static const char kTernoclFwhtSource[] = R\"TERNOCL(${TERNOCL_FWHT})TERNOCL\";\n")
+configure_file("${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc" "${CODEGEN_INCDIR}/ternocl_int2_kernels.inc" COPYONLY)
+
 ov_gpu_add_backend_target(
     NAME ${TARGET_NAME}
     INCLUDES $<BUILD_INTERFACE:${CODEGEN_INCDIR}>

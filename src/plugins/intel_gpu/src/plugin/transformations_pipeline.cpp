@@ -1621,14 +1621,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         const bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_fc_swiglu_fusion(), false);
 
         // The systolic FC epilogue does not natively consume a SwiGLU, but the
-        // XeTLA int2 experiment can benchmark the merged 2I projection followed
+        // TernOCL int2 path can benchmark the merged 2I projection followed
         // by the existing SwiGLU primitive.
-        const bool xetla_merge_mlp = std::getenv("OV_XETLA_INT2_MERGE_MLP") != nullptr;
+        const bool int2_merge_mlp = std::getenv("OV_TERNOCL_INT2_MERGE_MLP") != nullptr;
         // The 128-EU floor excludes the 64-EU integrated Xe2 part, where the
         // merged int2 projection is still the faster path.
-        bool fuse_mlp_swiglu = (!config.get_use_onednn() || xetla_merge_mlp) &&
-                               (!device_info.supports_immad || xetla_merge_mlp) &&
-                               (device_info.execution_units_count >= 128 || xetla_merge_mlp) &&
+        bool fuse_mlp_swiglu = (!config.get_use_onednn() || int2_merge_mlp) &&
+                               (!device_info.supports_immad || int2_merge_mlp) &&
+                               (device_info.execution_units_count >= 128 || int2_merge_mlp) &&
                                !disable_fc_swiglu_fusion;
         if (!disable_horizontal_fc_fusion) {
             manager.register_pass<ov::intel_gpu::FullyConnectedHorizontalFusion>(fuse_mlp_swiglu);
@@ -1643,8 +1643,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             }
         }
         // After the horizontal fusion so a merged gate/up FC absorbs the shared
-        // rotation once. OV_XETLA_INT2_FUSE_HADAMARD=0 keeps it in the graph.
-        if (const char* e = std::getenv("OV_XETLA_INT2_FUSE_HADAMARD"); e == nullptr || std::string(e) != "0") {
+        // rotation once. OV_TERNOCL_INT2_FUSE_HADAMARD=0 keeps it in the graph.
+        if (const char* e = std::getenv("OV_TERNOCL_INT2_FUSE_HADAMARD"); e == nullptr || std::string(e) != "0") {
             manager.register_pass<ov::intel_gpu::FuseHadamardIntoFC>();
         }
 

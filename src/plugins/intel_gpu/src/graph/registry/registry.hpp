@@ -77,15 +77,6 @@
 #    define OV_GPU_CREATE_INSTANCE_SYCL(...)
 #endif
 
-// SYCL kernels launched through OpenCL interop. Unlike OV_GPU_CREATE_INSTANCE_SYCL
-// this does not need the SYCL runtime, only a SYCL-capable compiler, so it is
-// available in the default OCL runtime build.
-#if OV_GPU_WITH_SYCL
-#    define OV_GPU_CREATE_INSTANCE_SYCL_OCL(...) EXPAND(CREATE_INSTANCE(__VA_ARGS__))
-#else
-#    define OV_GPU_CREATE_INSTANCE_SYCL_OCL(...)
-#endif
-
 #if OV_GPU_WITH_CM
 #    define OV_GPU_CREATE_INSTANCE_CM(...) EXPAND(CREATE_INSTANCE(__VA_ARGS__))
 #else

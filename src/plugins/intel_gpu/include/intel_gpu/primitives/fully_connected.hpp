@@ -173,7 +173,7 @@ struct fully_connected : public primitive_base<fully_connected> {
 
     /// @brief Input pre-transform: blockwise normalised Walsh-Hadamard of size
     /// hadamard_block along K, after an optional per-element sign flip. Set by
-    /// FuseHadamardIntoFC; only the XeTLA int2 implementation honours it.
+    /// FuseHadamardIntoFC; only the TernOCL int2 implementation honours it.
     size_t hadamard_block = 0;
     std::vector<int8_t> hadamard_signs;
 

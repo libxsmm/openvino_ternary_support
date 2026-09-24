@@ -57,7 +57,7 @@ bool is_hadamard_1024(const std::shared_ptr<ov::op::v0::Constant>& c) {
 }  // namespace
 
 bool FuseHadamardIntoFC::run_on_model(const std::shared_ptr<ov::Model>& model) {
-    const bool trace = std::getenv("OV_XETLA_HADAMARD_DEBUG") != nullptr;
+    const bool trace = std::getenv("OV_TERNOCL_HADAMARD_DEBUG") != nullptr;
     size_t fused = 0;
     for (const auto& node : model->get_ordered_ops()) {
         auto fc = ov::as_type_ptr<op::FullyConnectedCompressed>(node);
@@ -141,14 +141,14 @@ bool FuseHadamardIntoFC::run_on_model(const std::shared_ptr<ov::Model>& model) {
         }
         fc->input(0).replace_source_output(x);
         auto& rt = fc->get_rt_info();
-        rt[xetla_hadamard_block_key] = static_cast<int64_t>(kBlock);
-        rt[xetla_hadamard_signs_key] = signs;
+        rt[int2_hadamard_block_key] = static_cast<int64_t>(kBlock);
+        rt[int2_hadamard_signs_key] = signs;
         ++fused;
         if (trace)
             std::cerr << "[hadamard-fc] fused into " << fc->get_friendly_name() << " K=" << K
                       << " signs=" << (signs.empty() ? "folded" : "explicit") << std::endl;
     }
-    if (trace || (fused && std::getenv("OV_XETLA_INT2_DEBUG")))
+    if (trace || (fused && std::getenv("OV_TERNOCL_INT2_DEBUG")))
         std::cerr << "[hadamard-fc] fused " << fused << " input rotations" << std::endl;
     return fused != 0;
 }

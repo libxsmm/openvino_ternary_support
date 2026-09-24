@@ -10,8 +10,8 @@ namespace ov::intel_gpu {
 
 // rt_info keys carried on a FullyConnectedCompressed whose input transform was
 // absorbed; the FC translator moves them onto the cldnn primitive.
-inline constexpr char xetla_hadamard_block_key[] = "xetla_hadamard_block";
-inline constexpr char xetla_hadamard_signs_key[] = "xetla_hadamard_signs";
+inline constexpr char int2_hadamard_block_key[] = "int2_hadamard_block";
+inline constexpr char int2_hadamard_signs_key[] = "int2_hadamard_signs";
 
 // Folds the graph-level input rotation of Hadamard-basis checkpoints (Bonsai 2)
 //
@@ -19,7 +19,7 @@ inline constexpr char xetla_hadamard_signs_key[] = "xetla_hadamard_signs";
 //     -> Reshape(..., K) -> FullyConnectedCompressed(u2)
 //
 // into the FullyConnected itself, which then runs one fused sign+FWHT kernel in
-// front of its GEMV instead of three graph primitives. Only the XeTLA int2 FC
+// front of its GEMV instead of three graph primitives. Only the TernOCL int2 FC
 // implementation honours the resulting primitive fields.
 class FuseHadamardIntoFC : public ov::pass::ModelPass {
 public:

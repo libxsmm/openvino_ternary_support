@@ -73,9 +73,9 @@ static void CreateFullyConnectedCompressedOp(ProgramBuilder& p, const std::share
 
     // Input rotation absorbed by FuseHadamardIntoFC.
     const auto& rt = op->get_rt_info();
-    if (auto it = rt.find(xetla_hadamard_block_key); it != rt.end()) {
+    if (auto it = rt.find(int2_hadamard_block_key); it != rt.end()) {
         fc.hadamard_block = static_cast<size_t>(it->second.as<int64_t>());
-        if (auto st = rt.find(xetla_hadamard_signs_key); st != rt.end())
+        if (auto st = rt.find(int2_hadamard_signs_key); st != rt.end())
             fc.hadamard_signs = st->second.as<std::vector<int8_t>>();
     }
 
