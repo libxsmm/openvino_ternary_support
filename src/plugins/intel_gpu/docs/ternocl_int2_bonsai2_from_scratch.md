@@ -1,6 +1,7 @@
 # Bonsai 2 27B on OpenVINO GPU with the TernOCL int2 kernels — from scratch
 
-Curated, verified sequence (2026-09-24, branch `feature_integrate_2bit_ocl_kernels`)
+Curated, verified sequence (2026-09-24/25, branch `feature_integrate_2bit_ocl_kernels_mtp`,
+which is `feature_integrate_2bit_ocl_kernels` plus MTP speculative decoding, section 5.4)
 to go from an empty directory to Bonsai 2 27B decoding on an Arc Pro B70 and on
 a Lunar Lake Arc 140V. For background see
 [ternocl_int2_build_and_run.md](ternocl_int2_build_and_run.md) (full BKM, all
@@ -57,7 +58,7 @@ export ZE_AFFINITY_MASK=0        # multi-GPU hosts: which B70 to use
 
 ```bash
 mkdir -p $WORK && cd $WORK
-git clone -b feature_integrate_2bit_ocl_kernels https://github.com/libxsmm/openvino_ternary_support.git openvino
+git clone -b feature_integrate_2bit_ocl_kernels_mtp https://github.com/libxsmm/openvino_ternary_support.git openvino
 cd openvino && git submodule update --init --recursive && cd ..      # ~5 min, 30 submodules incl. thirdparty/TernOCL
 
 # gguf-py of the PrismML llama.cpp fork: stock gguf does not know the PQ2_0 tensor type
@@ -241,7 +242,7 @@ thinking, up to 4096 generated tokens): 50 min on the B70, `exact_match 0.968`
 
 ```bash
 hf download ProCreations/Ternary-Bonsai-2-27B-MTP model_mtp.safetensors --local-dir bonsai2-mtp
-$WORK/venv/bin/pip install safetensors torch --index-url https://download.pytorch.org/whl/cpu
+$WORK/venv/bin/pip install safetensors torch --extra-index-url https://download.pytorch.org/whl/cpu
 $WORK/venv/bin/python $TOOLS/bonsai2_mtp_to_ir.py \
     --ir $WORK/bonsai2-27b-u2/openvino_model.xml --mtp bonsai2-mtp/model_mtp.safetensors \
     --gguf bonsai2-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf --gguf-py llama.cpp-prism/gguf-py \
@@ -253,8 +254,8 @@ export BENCH_MTP=$WORK/bonsai2-27b-u2/openvino_mtp_i8_model.xml BENCH_MTP_K=3
 ```
 
 Expected on the B70 with the 5.1 command: 72 tok/s at k=3 (plain 42.7), with the
-same generated ids; on the Arc 140V 21.4 tok/s (plain 11.4). Keep batch <= 8
-when serving with MTP.
+same generated ids; on the Arc 140V with 128 tokens 21.4 tok/s (plain 11.4). Keep
+batch <= 8 when serving with MTP.
 
 ## 6. Knobs that matter
 

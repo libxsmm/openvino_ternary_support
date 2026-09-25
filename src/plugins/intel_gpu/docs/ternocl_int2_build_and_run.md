@@ -33,7 +33,7 @@ mkdir -p $WORK && cd $WORK
 
 git clone https://github.com/libxsmm/openvino_ternary_support.git openvino
 cd openvino
-git checkout feature_integrate_2bit_ocl_kernels
+git checkout feature_integrate_2bit_ocl_kernels_mtp   # = feature_integrate_2bit_ocl_kernels + MTP (7.4)
 git submodule update --init --recursive   # includes src/plugins/intel_gpu/thirdparty/TernOCL
 cd ..
 ```

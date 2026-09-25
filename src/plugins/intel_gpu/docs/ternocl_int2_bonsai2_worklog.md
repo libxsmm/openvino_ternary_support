@@ -114,7 +114,7 @@ branch `feature_integrate_2bit_ocl_kernels_mtp` (details in build_and_run 7.4):
 |---|---|---|---|
 | B70, batch 1 (tok/s) | 42.7 | **72.0** (x1.69) | 80.2 (x1.73 over 46.2) |
 | Arc 140V, batch 1 (tok/s) | 11.4 | **21.4** (x1.88) | 11.06 |
-| GSM8K 1319, B70 | 96.89% (batch 8) | **96.89%** (batch 8, 41.8 min) | 97.7% (300 examples) |
+| GSM8K 1319, B70 | 96.89% (batch 8, 51.5 min) | **96.89%** (batch 8, 43.2 min) | 97.7% (300 examples) |
 
 Per k=3 round on the B70: verify 25 ms GPU time (M = 4), 3 draft steps of
 1.6 ms GPU time each (the int8 head at ~510 GB/s); the remaining ~11 ms are
