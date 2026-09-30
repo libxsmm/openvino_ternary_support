@@ -230,14 +230,18 @@ overrides it, and the tools take it from the environment:
 3. Check accuracy: the serving processes inherit the environment, so prefix the
    step 5.2 command (or `run_lm_eval_ov.sh`) with `BENCH_KV_PRECISION=u4`.
 
-Arc Pro B70, BITCOS weights (`OV_TERNOCL_INT2_BITCOS=1`), batch 1; GSM8K as in 5.2:
+Arc Pro B70, batch 1; GSM8K as in 5.2 (int2: int8 prefill off / on):
 
-| KV cache | Peak VRAM, 160k context | Decode, 8k prompt | GSM8K |
-|---|---|---|---|
-| f16 | 16.52 GiB | 42.9 tok/s | 0.9697 |
-| i8 (keys by channel) | 12.18 GiB | 42.9 tok/s | 0.9689 |
-| i8, `BENCH_KEY_QUANT_MODE=BY_TOKEN` | 11.60 GiB | 43.3 tok/s | not run |
-| u4 | 9.68 GiB | 43.1 tok/s | 0.9682 |
+| KV cache | Weights | Peak VRAM, 160k context | Decode, 8k prompt | GSM8K |
+|---|---|---|---|---|
+| f16 | int2 | 17.34 GiB | 39.8 tok/s | 0.9697 / 0.9689 |
+| f16 | BITCOS | 16.52 GiB | 42.9 tok/s | 0.9697 |
+| i8 (keys by channel) | int2 | 13.00 GiB | 39.7 tok/s | 0.9689 / 0.9682 |
+| i8 (keys by channel) | BITCOS | 12.18 GiB | 42.9 tok/s | 0.9689 |
+| i8, `BENCH_KEY_QUANT_MODE=BY_TOKEN` | int2 | 12.42 GiB | 39.8 tok/s | not run |
+| i8, `BENCH_KEY_QUANT_MODE=BY_TOKEN` | BITCOS | 11.60 GiB | 43.3 tok/s | not run |
+| u4 | int2 | 10.50 GiB | 40.3 tok/s | 0.9682 / 0.9689 |
+| u4 | BITCOS | 9.68 GiB | 43.1 tok/s | 0.9682 |
 
 The differences in score are within the standard error (0.0048); prefill time
 is unchanged at 1k and 8k prompts.
