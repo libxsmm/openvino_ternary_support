@@ -200,6 +200,48 @@ serving process per GPU; `--batch` is then per GPU.
 Full test set (1319 examples, thinking, up to 4096 generated tokens):
 `exact_match 0.970` (1279/1319). First 100: ~0.96-0.98 depending on the slice.
 
+### 5.3 Long context: quantized KV cache
+
+The 16 full-attention layers keep 64 KiB of fp16 K/V per token, so at long
+context the KV cache outgrows the weights (160k tokens: 10 GiB). OpenVINO can
+store it quantized, set at compile time:
+
+| Property | Values | On the GPU plugin |
+|---|---|---|
+| `KV_CACHE_PRECISION` (`ov::hint::kv_cache_precision`) | `f16`, `i8`, `u8`, `u4` | one precision for K and V, asymmetric with an fp16 scale and zero point inline in each block |
+| `KEY_CACHE_QUANT_MODE` (`ov::internal::key_cache_quant_mode`) | `BY_CHANNEL` (default), `BY_TOKEN` | keys per channel over 16-token groups, or per token and head; `u4` uses `BY_CHANNEL` |
+
+Values are always quantized per token. The converted IR pins
+`KV_CACHE_PRECISION=f16` in its runtime options; a compile-time property
+overrides it, and the tools take it from the environment:
+
+1. Decode with a 4-bit KV cache (`i8` for 8-bit):
+
+   ```bash
+   BENCH_KV_PRECISION=u4 BENCH_PRECISION=f16 BENCH_MAX_LEN=512 BENCH_NO_EOS=1 \
+     $TOOLS/build/paged_bench_llm_27b $WORK/bonsai2-27b-u2/openvino_model.xml \
+     $WORK/bonsai2-27b-u2/openvino_text_embeddings_model.xml GPU 256 "$IDS"
+   ```
+
+2. Reserve a long context: `BENCH_MAX_LEN` sizes the cache (e.g. `163840` for
+   160k tokens), so compare the peak device memory with and without
+   `BENCH_KV_PRECISION` at the same `BENCH_MAX_LEN`.
+
+3. Check accuracy: the serving processes inherit the environment, so prefix the
+   step 5.2 command (or `run_lm_eval_ov.sh`) with `BENCH_KV_PRECISION=u4`.
+
+Arc Pro B70, BITCOS weights (`OV_TERNOCL_INT2_BITCOS=1`), batch 1; GSM8K as in 5.2:
+
+| KV cache | Peak VRAM, 160k context | Decode, 8k prompt | GSM8K |
+|---|---|---|---|
+| f16 | 16.52 GiB | 42.9 tok/s | 0.9697 |
+| i8 (keys by channel) | 12.18 GiB | 42.9 tok/s | 0.9689 |
+| i8, `BENCH_KEY_QUANT_MODE=BY_TOKEN` | 11.60 GiB | 43.3 tok/s | not run |
+| u4 | 9.68 GiB | 43.1 tok/s | 0.9682 |
+
+The differences in score are within the standard error (0.0048); prefill time
+is unchanged at 1k and 8k prompts.
+
 ## 6. Knobs that matter
 
 On/off variables take `1` or `0` (also `true`/`false`, `on`/`off`); any other
@@ -215,6 +257,8 @@ value is rejected with an error.
 | `OV_TERNOCL_INT2_CFG_DEBUG` | 0 | `1`: every OpenCL program built and the tile chosen per (shape, M class) |
 | `OV_TERNOCL_HADAMARD_DEBUG` | 0 | `1`: trace the rotation fusion per FC (expect "fused 257 input rotations") |
 | `BENCH_MAX_LEN` | 512 | context the bench reserves; prompt + new tokens must fit |
+| `BENCH_KV_PRECISION` | IR (`f16`) | KV cache precision (`i8`, `u8`, `u4`), section 5.3 |
+| `BENCH_KEY_QUANT_MODE` | `BY_CHANNEL` | key quantization grouping (`BY_TOKEN`), section 5.3 |
 
 ## 7. Troubleshooting
 

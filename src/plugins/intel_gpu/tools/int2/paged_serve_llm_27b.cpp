@@ -131,6 +131,11 @@ int main(int argc, char** argv) {
         ov::Core core;
         const char* precision = std::getenv("BENCH_PRECISION");
         ov::AnyMap config{{"INFERENCE_PRECISION_HINT", precision ? precision : "f16"}};
+        // The IR pins KV_CACHE_PRECISION f16; e.g. BENCH_KV_PRECISION=i8 or u4, BENCH_KEY_QUANT_MODE=BY_TOKEN.
+        if (const char* kv = std::getenv("BENCH_KV_PRECISION"))
+            config["KV_CACHE_PRECISION"] = kv;
+        if (const char* km = std::getenv("BENCH_KEY_QUANT_MODE"))
+            config["KEY_CACHE_QUANT_MODE"] = km;
         const bool profile = std::getenv("BENCH_PROFILE") != nullptr;
         if (profile)
             config[ov::enable_profiling.name()] = true;
