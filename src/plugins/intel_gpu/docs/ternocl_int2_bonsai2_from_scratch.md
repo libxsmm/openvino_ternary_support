@@ -209,6 +209,7 @@ value is rejected with an error.
 |---|---|---|
 | `OV_TERNOCL_INT2_FUSE_HADAMARD` | 1 | fuse the Hadamard rotation into the FC; `0` leaves it as separate graph ops (debug fallback, slower) |
 | `OV_TERNOCL_INT2_INT8_PREFILL` | 0 | `1`: prompts and batches (M > 8) on the int2 x int8 DPAS kernel (activations quantized to int8 per 128-group); same weights, GSM8K within the standard error of the default |
+| `OV_TERNOCL_INT2_BITCOS` | 0 | `1`: weights in the BITCOS layout (1.67 bits/weight on Bonsai 2 27B) instead of int2, resident once; B70: peak VRAM 7.40 -> 6.58 GiB, decode 42.5 -> 45.9 tok/s, prefill slower (1k prompt 1.47 vs 0.89 s), same tokens and GSM8K (0.9697); overrides the int8 prefill |
 | `OV_TERNOCL_INT2_DISABLE` | 0 | `1`: use the stock OpenVINO FC kernels instead of TernOCL (the Hadamard rotation then runs as graph ops and the gate/up merge follows the stock heuristic) |
 | `OV_TERNOCL_INT2_DEBUG` | 0 | `1`: which FCs the TernOCL impl accepted and why others were rejected |
 | `OV_TERNOCL_INT2_CFG_DEBUG` | 0 | `1`: every OpenCL program built and the tile chosen per (shape, M class) |

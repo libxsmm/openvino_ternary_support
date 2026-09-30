@@ -29,6 +29,7 @@ same packed weights:
 |---|---|---|---|
 | **int2 x f16 up-convert** | `int2_fp16_upcvt/int2_fp16_upcvt.cl` | 2-bit weights dequantized to fp16 in registers (group scale folded in with integer ops), fp16 DPAS, fp32 accumulation, native fp16 activations | all M (default) |
 | **int2 x int8 DPAS** | `int2_via_int2_x_int8_dpas/int2_int8_dpas.cl` | activations quantized to int8 per (row, 128-group), native s8 x s2 DPAS on the 2-bit codes, int32 accumulation, per-group rescale | M > 8 with `OV_TERNOCL_INT2_INT8_PREFILL=1` (off by default) |
+| **BITCOS x f16 up-convert** | `bitcos_fp16_upcvt/bitcos_fp16_upcvt.cl` | weights in the BITCOS layout (presence bitmap + compacted signs, `2 - z` bits per weight at zero fraction `z`), decoded through an SLM table to fp16, fp16 DPAS, fp32 accumulation | all M with `OV_TERNOCL_INT2_BITCOS=1` (off by default); replaces both families above |
 
 Both share the epilogue (`common/epilogue.clh`); rotated-basis checkpoints add
 the input transform `hadamard/hadamard_fwht.cl` in front of either.
@@ -98,6 +99,14 @@ Performed once per node in `create()`:
   row `16*kb+j` at bits `[2j, 2j+1]`. The result is a `[K/16, N]` USM device buffer.
   Both GEMM families read this layout: the up-convert kernels dequantize it, the
   int8 kernels feed the codes to the s8 x s2 DPAS as they are.
+- **BITCOS weights** (`OV_TERNOCL_INT2_BITCOS=1`, `K % 64 == 0`): instead of the
+  int2 layout, one `uint32` buffer with a presence bitmap `[K/32][N]`, per-column
+  offsets `[N]` and the sign bits of the non-zeros, column-major (TernOCL
+  `common/bitcos.hpp`), plus the per-column slice ranks the chosen GEMV tiles need.
+  When the weight constant has no other user and no model cache is exported, the
+  constant is re-attached as a view of the BITCOS buffer: already device memory, it
+  is never transferred, and its host copy is released, so the weights are resident
+  once, at `2 - z` bits (Bonsai 2 27B: z = 0.33, 1.67 bits; peak VRAM 7.40 -> 6.58 GiB).
 - **Scales**: OpenVINO stores them `[N, K/128]`; the kernels want `[K/128, N]`,
   transposed once into a device buffer.
 - **Hadamard signs** (rotated checkpoints): the `+-1` vector as `i8[K]` on the device.
@@ -192,6 +201,18 @@ neither, so decode is unchanged and no `[M, K]` int8 scratch is needed.
 final radix-2 pass that scales and stores, fp32 butterflies. Its output feeds
 either GEMM family.
 
+### 5.4 BITCOS x f16 up-convert (`bitcos_fp16_upcvt.cl`, `OV_TERNOCL_INT2_BITCOS=1`)
+
+| Kernel | Used for | Options |
+|---|---|---|
+| `bitcos_fp16_upcvt_gemv` | GEMV, M <= 8 | `SGM`, `NSG_N`, `LS` as the int2 GEMV; with `LS > 1` each K slice starts at its column's slice rank |
+| `bitcos_fp16_upcvt_gemm_mt` | M > 8 | `MT_M x MT_N`, `WG_M x WG_N`, 256 GRF; the 64-k BITCOS block is unpacked once per 16 columns and reused for all `MT_M/8` DPAS row blocks |
+
+The decoded weights are the same fp16 values as the int2 up-convert path, so on
+Bonsai 2 27B greedy tokens match it exactly (GSM8K 0.9697, as the int2 path). Decode reads fewer bytes (B70:
+45.9 vs 42.5 tok/s); prefill is slower than the int2 kernels (1k-token prompt
+1.47 vs 0.89 s), and the int8 prefill is not available, since it needs the int2 codes.
+
 ---
 
 ## 6. Configuration selection
@@ -205,6 +226,8 @@ launch class and build its kernels on first use:
 | 9..16, 17..32, 33..63 | up-convert M-tiled | `mt_tile()`: one tile per M band and output width class (N <= 8192, < 65536, >= 65536), per GPU class |
 | >= 64 | up-convert M-tiled | `mt_tile()`: exact (K, N) entries, per GPU class |
 | > 8, with `OV_TERNOCL_INT2_INT8_PREFILL=1` | `quant_a` + `int2_int8_gemm_mt` | `int8_tile()`: exact (K, N) entries per M band (<= 16, <= 32, < 64, >= 64), default tile per band |
+| <= 8, with `OV_TERNOCL_INT2_BITCOS=1` | `bitcos_fp16_upcvt_gemv` | `bitcos_tile()`: exact (K, N) entries per `SGM` |
+| > 8, with `OV_TERNOCL_INT2_BITCOS=1` | `bitcos_fp16_upcvt_gemm_mt` | `bitcos_mt_tile()`: exact (K, N) entries for M <= 32 and above |
 
 The tiles are hard-coded tables in `fully_connected_ternocl_int2.cpp`, filled from
 TernOCL's benchmark sweeps (`bench.sh`, `sweep_midm.sh`):
@@ -220,7 +243,8 @@ TernOCL's benchmark sweeps (`bench.sh`, `sweep_midm.sh`):
 Overrides for sweeps: `OV_TERNOCL_INT2_GEMV="wgn,ls,u"`,
 `OV_TERNOCL_INT2_MID="mt_m,mt_n,wg_m,wg_n"` (M < 64),
 `OV_TERNOCL_INT2_MT="..."` (M >= 64), `OV_TERNOCL_INT2_INT8_MT="..."` (int8
-prefill); `OV_TERNOCL_INT2_CFG_DEBUG=1` prints every built program and chosen tile.
+prefill), `OV_TERNOCL_INT2_BITCOS_TILE="wgn,ls"` and `OV_TERNOCL_INT2_BITCOS_MT="..."`
+(BITCOS); `OV_TERNOCL_INT2_CFG_DEBUG=1` prints every built program and chosen tile.
 
 ---
 
