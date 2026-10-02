@@ -215,8 +215,9 @@ $WORK/venv/bin/python $TOOLS/bonsai2_mtp_to_ir.py \
 export BENCH_MTP=$WORK/bonsai2-27b-u2/openvino_mtp_i8_model.xml BENCH_MTP_K=3
 ```
 
-Expected on the B70 with the 5.1 command: 72 tok/s at k=3 (plain 42.7), with the
-same generated ids; on the Arc 140V with 128 tokens 21.4 tok/s (plain 11.4). Keep
+Expected on the B70 with the 5.1 command: 82 tok/s at k=3 (plain 53; k=1/2/4:
+73/77/77, acceptance 88/77/65/55% for k=1..4), with the same generated ids; on the
+Arc 140V with 128 tokens 24.5 tok/s (plain 13.2). Keep
 batch <= 8 when serving with MTP.
 
 ## 6. Knobs that matter
