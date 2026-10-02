@@ -722,10 +722,11 @@ public:
             std::vector<uint8_t> wei_host(wei_mem->size());
             wei_mem->copy_to(stream, wei_host.data(), true);
             std::vector<uint32_t> packed(packed_bytes / sizeof(uint32_t));
-            if (bits == 1)
+            if (bits == 1) {
                 pack_weights_u1(wei_host.data(), packed.data(), N, K);
-            else
+            } else {
                 pack_weights(wei_host.data(), packed.data(), N, K, static_cast<int32_t>(std::lround(zp)));
+            }
             if (in_place) {
                 wei_mem->copy_from(stream, packed.data(), 0, 0, packed_bytes, true);
                 own.weights_id = arg.weights().id();
