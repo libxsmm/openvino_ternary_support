@@ -204,7 +204,7 @@ Full test set (1319 examples, thinking, up to 4096 generated tokens):
 
 ```bash
 hf download ProCreations/Ternary-Bonsai-2-27B-MTP model_mtp.safetensors --local-dir bonsai2-mtp
-$WORK/venv/bin/pip install safetensors torch --index-url https://download.pytorch.org/whl/cpu
+$WORK/venv/bin/pip install safetensors torch --extra-index-url https://download.pytorch.org/whl/cpu
 $WORK/venv/bin/python $TOOLS/bonsai2_mtp_to_ir.py \
     --ir $WORK/bonsai2-27b-u2/openvino_model.xml --mtp bonsai2-mtp/model_mtp.safetensors \
     --gguf bonsai2-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf --gguf-py llama.cpp-prism/gguf-py \
@@ -216,8 +216,8 @@ export BENCH_MTP=$WORK/bonsai2-27b-u2/openvino_mtp_i8_model.xml BENCH_MTP_K=3
 ```
 
 Expected on the B70 with the 5.1 command: 72 tok/s at k=3 (plain 42.7), with the
-same generated ids; on the Arc 140V 21.4 tok/s (plain 11.4). Keep batch <= 8
-when serving with MTP.
+same generated ids; on the Arc 140V with 128 tokens 21.4 tok/s (plain 11.4). Keep
+batch <= 8 when serving with MTP.
 
 ## 6. Knobs that matter
 
