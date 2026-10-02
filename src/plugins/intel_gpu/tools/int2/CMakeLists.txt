@@ -5,10 +5,12 @@ project(int2_tools CXX)
 set(CMAKE_CXX_STANDARD 17)
 find_package(OpenVINO REQUIRED)
 
+# bench_llm            8B-class (qwen3) stateful decoders, e.g. Bonsai-8B
+# paged_bench_llm      the same through SDPAToPagedAttention
 # Bonsai 27B-class decoders (separate embedding model, rank-3 mrope, paged attention):
 # paged_bench_llm_27b  single-sequence greedy generation with TTFT / decode timing
 # paged_serve_llm_27b  batched (continuous-batching) generation from a request file, for eval harnesses
-foreach(tool paged_bench_llm_27b paged_serve_llm_27b)
+foreach(tool bench_llm paged_bench_llm paged_bench_llm_27b paged_serve_llm_27b)
     add_executable(${tool} ${tool}.cpp)
     target_link_libraries(${tool} PRIVATE openvino::runtime)
 endforeach()

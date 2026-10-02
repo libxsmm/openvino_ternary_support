@@ -22,6 +22,18 @@
 
 namespace ov::intel_gpu {
 
+namespace {
+// Narrow ternary/binary projections (GatedDeltaNet a/b gates) keep their own FC, whose epilogue folds the gate.
+bool is_narrow_low_bit(const std::shared_ptr<op::FullyConnectedCompressed>& fc) {
+    const auto et = fc->get_input_element_type(1);
+    if (et != ov::element::u2 && et != ov::element::u1)
+        return false;
+    const auto& ps = fc->get_input_partial_shape(1);
+    const size_t n_axis = fc->get_transpose_b() ? 0 : 1;
+    return ps.rank().is_static() && ps.size() == 2 && ps[n_axis].is_static() && ps[n_axis].get_length() < 128;
+}
+}  // namespace
+
 FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swiglu) {
     using namespace ov::pass::pattern;
 
@@ -64,7 +76,7 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
         int32_t nodes_with_zp = 0;
         for (const auto& u : input->get_users()) {
             const auto& fc_user = ov::as_type_ptr<op::FullyConnectedCompressed>(u);
-            if (!fc_user) {
+            if (!fc_user || is_narrow_low_bit(fc_user)) {
                 continue;
             }
 
@@ -112,7 +124,7 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
         int32_t bias_rank = -1;
         for (auto user : input_node->get_users()) {
             auto fc_user = ov::as_type_ptr<op::FullyConnectedCompressed>(user);
-            if (fc_user) {
+            if (fc_user && !is_narrow_low_bit(fc_user)) {
                 OPENVINO_ASSERT(fc_user->inputs().size() >= 4, "Compressed FC should have at least 4 inputs");
                 fc_nodes.push_back(fc_user);
                 fc_nodes_vec.push_back(fc_user);

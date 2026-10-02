@@ -23,6 +23,7 @@
 #    include "fully_connected_inst.h"
 #    include "intel_gpu/runtime/kernel_args.hpp"
 #    include "intel_gpu/runtime/memory.hpp"
+#    include "openvino/core/parallel.hpp"
 #    include "openvino/util/env_util.hpp"
 #    include "primitive_inst.h"
 #    include "reorder_inst.h"
@@ -51,6 +52,25 @@ void pack_weights(const uint8_t* src, uint32_t* dst, size_t N, size_t K, int32_t
             dst[(k / kTernoclPackFactor) * N + n] |= static_cast<uint32_t>(code & 0x3) << (2 * (k % kTernoclPackFactor));
         }
     }
+}
+
+// [N, K] u1 bits b (weight (b - 1/2) * scale) -> the int1 kernel's [K/32, N] select masks, set
+// where the weight is negative: word (kp, n0 + p) of 16-column block n0 holds row 32kp + 2p + (j & 1)
+// of column n0 + j/2 at bit j. OpenVINO packs u1 MSB first.
+void pack_weights_u1(const uint8_t* src, uint32_t* dst, size_t N, size_t K) {
+    std::fill(dst, dst + (K / 32) * N, 0u);
+    ov::parallel_for(N / 16, [&](size_t nb) {
+        for (size_t c = 0; c < 16; ++c) {
+            const size_t n = nb * 16 + c;
+            const uint8_t* row = src + n * K / 8;
+            for (size_t k = 0; k < K; ++k) {
+                if (((row[k >> 3] >> (7 - (k & 7))) & 1) == 0) {
+                    const size_t r = k % 32;
+                    dst[(k / 32) * N + nb * 16 + r / 2] |= 1u << (2 * c + (r & 1));
+                }
+            }
+        }
+    });
 }
 
 // The zero point carries whatever precision the model used, so read it by type.
@@ -117,7 +137,7 @@ bool env_ints(const char* name, int* v, int n) {
     return true;
 }
 
-GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
+GemvTile gemv_tile(size_t K, size_t N, bool integrated, int bits) {
     GemvTile t{0, 0, 0};
     if (env_ints("OV_TERNOCL_INT2_GEMV", &t.wgn, 3))  // "wgn,ls,u" for sweeps
         return t;
@@ -125,6 +145,24 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
         size_t k, n;
         GemvTile t;
     };
+    // Arc Pro B70, M = 1 (TernOCL int1_fp16_upcvt README).
+    static const Entry int1_discrete[] = {
+        {5120, 34816, {32, 4, 2}},
+        {17408, 5120, {16, 4, 2}},
+        {5120, 16384, {32, 2, 2}},
+        {6144, 5120, {64, 4, 2}},
+        {5120, 14336, {32, 2, 2}},
+        {5120, 248320, {32, 1, 2}},
+    };
+    if (bits == 1) {
+        if (!integrated) {
+            for (const auto& e : int1_discrete) {
+                if (e.k == K && e.n == N)
+                    return e.t;
+            }
+        }
+        return N <= 8192 ? GemvTile{32, 4, 2} : GemvTile{32, 2, 2};
+    }
     // Arc Pro B70, M = 1 (TernOCL int2_fp16_upcvt default_tiles).
     static const Entry discrete[] = {
         {4096, 6144, {16, 4, 1}},    // 8B qkv
@@ -161,7 +199,7 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
     return N <= 8192 ? GemvTile{32, 4, 1} : GemvTile{32, 2, 1};
 }
 
-MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated) {
+MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated, int bits) {
     MtTile t{0, 0, 0, 0};
     if (M < 64) {
         if (env_ints("OV_TERNOCL_INT2_MID", &t.mt_m, 4))  // "mt_m,mt_n,wg_m,wg_n"
@@ -185,6 +223,21 @@ MtTile mt_tile(size_t K, size_t N, size_t M, bool integrated) {
         size_t k, n;
         MtTile t;
     };
+    // Arc Pro B70, M = 1024 (TernOCL int1_fp16_upcvt README).
+    static const Entry int1_table[] = {
+        {5120, 34816, {64, 32, 4, 4}},
+        {17408, 5120, {32, 32, 1, 8}},
+        {5120, 16384, {32, 32, 2, 2}},
+        {6144, 5120, {32, 32, 1, 8}},
+        {5120, 14336, {32, 32, 2, 2}},
+        {5120, 248320, {64, 32, 4, 2}},
+    };
+    if (bits == 1 && !integrated) {
+        for (const auto& e : int1_table) {
+            if (e.k == K && e.n == N)
+                return e.t;
+        }
+    }
     // Arc Pro B70, M = 1024 (TernOCL int2_fp16_upcvt README).
     static const Entry table[] = {
         {4096, 6144, {64, 32, 4, 4}},
@@ -331,6 +384,7 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
     bool _out_f32 = false;
     size_t _had_block = 0;
     bool _integrated = false;
+    int _bits = 2;
 
     // GEMV for M = 1, 2, <= 4, <= 8; M-tiled for M <= 16, <= 32, < 64, >= 64.
     struct Launch {
@@ -355,7 +409,8 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
                                  int postop,
                                  size_t other_dep,
                                  bool out_f32,
-                                 size_t had_block)
+                                 size_t had_block,
+                                 int bits)
         : parent("ternocl_int2"),
           _engine(&engine),
           _own(std::move(own)),
@@ -365,7 +420,8 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
           _other_dep(other_dep),
           _out_f32(out_f32),
           _had_block(had_block),
-          _integrated(engine.get_device_info().dev_type == device_type::integrated_gpu) {}
+          _integrated(engine.get_device_info().dev_type == device_type::integrated_gpu),
+          _bits(bits) {}
 
     std::unique_ptr<primitive_impl> clone() const override {
         // Shares the kernel handles like the stock OCL impls: OpenVINO clones
@@ -390,7 +446,7 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
         std::vector<BufferDescriptor> descs;
         if (_had_block != 0)
             descs.emplace_back(M * _K, ov::element::f16);
-        if (int8_prefill_enabled() && M > 8)
+        if (int8_prefill() && M > 8)
             descs.emplace_back((_K / kTernoclGroupSize) * ((M + 31) & ~size_t{31}), ov::element::f16);
         return descs;
     }
@@ -399,6 +455,11 @@ protected:
     void init_kernels(const kernels_cache&, const kernel_impl_params&) override {}
     void set_arguments_impl(typed_primitive_inst<fully_connected>&) override {}
     void set_arguments_impl(typed_primitive_inst<fully_connected>&, kernel_arguments_data&) override {}
+
+    // The int2 x int8 GEMM has no binary counterpart.
+    bool int8_prefill() const {
+        return _bits == 2 && int8_prefill_enabled();
+    }
 
     std::string epi_opts() const {
         return " -DPOSTOP=" + std::to_string(_postop) + (_out_f32 ? " -DOUT_F32" : "");
@@ -415,20 +476,21 @@ protected:
         if (l.k)
             return l;
         std::string opts = "-cl-std=CL3.0";
+        const char* src = _bits == 1 ? kTernoclInt1Source : kTernoclUpcvtSource;
         if (M <= 8) {
             const int sgm = M == 1 ? 1 : (M == 2 ? 2 : (M <= 4 ? 4 : 8));
-            l.g = gemv_tile(_K, _N, _integrated);
+            l.g = gemv_tile(_K, _N, _integrated, _bits);
             opts += " -DSGM=" + std::to_string(sgm) + " -DNSG_N=" + std::to_string(l.g.wgn / 16) + " -DLS=" + std::to_string(l.g.ls) +
                     " -DU=" + std::to_string(l.g.u) + " -DPF=0";
-            l.k = make_kernel(*_engine, get_program(*_engine, kTernoclUpcvtSource, opts + epi_opts()), "int2_fp16_upcvt_gemm");
+            l.k = make_kernel(*_engine, get_program(*_engine, src, opts + epi_opts()), _bits == 1 ? "int1_fp16_upcvt_gemm" : "int2_fp16_upcvt_gemm");
         } else {
-            l.t = mt_tile(_K, _N, M, _integrated);
+            l.t = mt_tile(_K, _N, M, _integrated, _bits);
             opts += " -DMT_M=" + std::to_string(l.t.mt_m) + " -DMT_N=" + std::to_string(l.t.mt_n) + " -DWG_M=" + std::to_string(l.t.wg_m) +
                     " -DWG_N=" + std::to_string(l.t.wg_n) + " -cl-intel-256-GRF-per-thread";
-            l.k = make_kernel(*_engine, get_program(*_engine, kTernoclUpcvtSource, opts + epi_opts()), "int2_fp16_upcvt_gemm_mt");
+            l.k = make_kernel(*_engine, get_program(*_engine, src, opts + epi_opts()), _bits == 1 ? "int1_fp16_upcvt_gemm_mt" : "int2_fp16_upcvt_gemm_mt");
         }
         if (ov::util::getenv_bool("OV_TERNOCL_INT2_CFG_DEBUG"))
-            std::cerr << "[ternocl-int2] K=" << _K << " N=" << _N << " M-class " << launch_class(M) << ": " << opts << epi_opts() << std::endl;
+            std::cerr << "[ternocl-int" << _bits << "] K=" << _K << " N=" << _N << " M-class " << launch_class(M) << ": " << opts << epi_opts() << std::endl;
         return l;
     }
 
@@ -552,7 +614,7 @@ protected:
             in = rotated;
         }
 
-        if (M > 8 && int8_prefill_enabled())
+        if (M > 8 && int8_prefill())
             return execute_int8(instance, *pk, in, deps, M);
 
         auto& l = get_launch(M);
@@ -605,6 +667,7 @@ public:
         const size_t N = wei_shape[0];
         const size_t K = wei_shape[1];
         const auto& desc = arg.get_primitive();
+        const int bits = arg.weights().get_output_layout(false).data_type == data_types::u1 ? 1 : 2;
 
         size_t other_dep = 0;
         const int postop = ternocl_int2_postop(impl_params.fused_desc, desc->bias.is_valid(), &other_dep);
@@ -634,16 +697,17 @@ public:
         if (!packed_already(own)) {
             // Dependencies are input, weights, [bias], scale, [zero point].
             const size_t scale_dep_idx = desc->bias.is_valid() ? 3 : 2;
-            int32_t zp = 0;
+            float zp = 0.0f;
             if (desc->decompression_zero_point_scalar.has_value()) {
-                zp = static_cast<int32_t>(std::lround(desc->decompression_zero_point_scalar.value()));
+                zp = desc->decompression_zero_point_scalar.value();
             } else if (desc->decompression_zero_point.is_valid()) {
                 const auto* zp_node = const_source(&arg.get_dependency(scale_dep_idx + 1));
                 OPENVINO_ASSERT(zp_node != nullptr, "[GPU] ternocl int2: zero point is not constant");
-                zp = static_cast<int32_t>(std::lround(read_scalar(zp_node->as<data>().get_attached_memory_ptr(), stream)));
+                zp = read_scalar(zp_node->as<data>().get_attached_memory_ptr(), stream);
             }
+            OPENVINO_ASSERT(bits == 2 || zp == 0.5f, "[GPU] ternocl int1: ", arg.id(), " has zero point ", zp, ", binary weights need 1/2");
 
-            const size_t packed_bytes = N * K / 4;
+            const size_t packed_bytes = N * K * bits / 8;
             OPENVINO_ASSERT(wei_mem->size() >= packed_bytes,
                             "[GPU] ternocl int2: weight buffer ",
                             wei_mem->size(),
@@ -657,14 +721,17 @@ public:
             // Blocking copies: mapping a large device constant can expose it before it is resident.
             std::vector<uint8_t> wei_host(wei_mem->size());
             wei_mem->copy_to(stream, wei_host.data(), true);
-            std::vector<uint32_t> packed((K / kTernoclPackFactor) * N);
-            pack_weights(wei_host.data(), packed.data(), N, K, zp);
+            std::vector<uint32_t> packed(packed_bytes / sizeof(uint32_t));
+            if (bits == 1)
+                pack_weights_u1(wei_host.data(), packed.data(), N, K);
+            else
+                pack_weights(wei_host.data(), packed.data(), N, K, static_cast<int32_t>(std::lround(zp)));
             if (in_place) {
                 wei_mem->copy_from(stream, packed.data(), 0, 0, packed_bytes, true);
                 own.weights_id = arg.weights().id();
             } else {
                 own.weights = engine.allocate_memory(
-                    layout{ov::PartialShape{static_cast<int64_t>(K / kTernoclPackFactor), static_cast<int64_t>(N)}, data_types::i32, format::bfyx},
+                    layout{ov::PartialShape{static_cast<int64_t>(packed_bytes / sizeof(uint32_t) / N), static_cast<int64_t>(N)}, data_types::i32, format::bfyx},
                     allocation_type::usm_device,
                     false);
                 own.weights->copy_from(stream, packed.data(), true);
@@ -687,6 +754,11 @@ public:
                 for (size_t n = 0; n < N; ++n)
                     scale_host[g * N + n] = n_major ? scale_src[n * groups + g] : scale_src[g * N + n];
             }
+            // (b - 1/2) * scale is +-scale/2.
+            if (bits == 1) {
+                for (auto& s : scale_host)
+                    s = ov::float16(0.5f * static_cast<float>(ov::float16::from_bits(s))).to_bits();
+            }
             own.scales = engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(groups), static_cast<int64_t>(N)}, data_types::f16, format::bfyx},
                                                 allocation_type::usm_device,
                                                 false);
@@ -708,11 +780,19 @@ public:
             ternocl_packed_cache().try_emplace(key, own);
         }
         if (dbg) {
-            std::cerr << "[ternocl-int2] create " << arg.id() << " N=" << N << " K=" << K << " postop=" << postop << " out_f32=" << out_f32
+            std::cerr << "[ternocl-int2] create " << arg.id() << " bits=" << bits << " N=" << N << " K=" << K << " postop=" << postop << " out_f32=" << out_f32
                       << " hadamard=" << desc->hadamard_block << std::endl;
         }
 
-        return std::make_unique<fully_connected_ternocl_int2>(downcast<const ocl_engine>(engine), own, N, K, postop, other_dep, out_f32, desc->hadamard_block);
+        return std::make_unique<fully_connected_ternocl_int2>(downcast<const ocl_engine>(engine),
+                                                              own,
+                                                              N,
+                                                              K,
+                                                              postop,
+                                                              other_dep,
+                                                              out_f32,
+                                                              desc->hadamard_block,
+                                                              bits);
     }
 };
 

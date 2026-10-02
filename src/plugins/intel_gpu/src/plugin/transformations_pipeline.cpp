@@ -593,7 +593,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
     const auto& defaultPrecisions = ov::pass::low_precision::precision_set::get_int8_support();
     const ov::element::TypeVector supported_woq_types =
-        {ov::element::u8, ov::element::i8, ov::element::u4, ov::element::i4, ov::element::u2};
+        {ov::element::u8, ov::element::i8, ov::element::u4, ov::element::i4, ov::element::u2, ov::element::u1};
     bool enableInt8;
     bool unroll_loop = config.get_enable_loop_unrolling();
     const bool disable_gated_mlp_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_gated_mlp_fusion(), true);
@@ -678,8 +678,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         manager.register_pass<ov::pass::TransposeMatMul>();
 
-        manager.register_pass<ov::pass::MarkDequantization>(std::vector<ov::element::Type>{ov::element::i8, ov::element::u8, ov::element::i4, ov::element::u4, ov::element::u2},
-                                                            !device_info.supports_immad);
+        manager.register_pass<ov::pass::MarkDequantization>(
+            std::vector<ov::element::Type>{ov::element::i8, ov::element::u8, ov::element::i4, ov::element::u4, ov::element::u2, ov::element::u1},
+            !device_info.supports_immad);
         if (config.get_use_onednn() && m_context->get_engine().get_device_info().arch >= cldnn::gpu_arch::xe3p) {
             manager.register_pass<ov::pass::MarkDequantization>(
                 std::vector<ov::element::Type>{ov::element::f8e4m3, ov::element::f8e5m2, ov::element::f4e2m1, ov::element::f8e8m0},
@@ -1752,13 +1753,13 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         const bool disable_horizontal_fc_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_horizontal_fc_fusion(), false);
         const bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_fc_swiglu_fusion(), false);
 
-        // Ternary (u2) checkpoints on the TernOCL path run faster with gate/up merged into
+        // Ternary (u2) and binary (u1) checkpoints on the TernOCL path run faster with gate/up merged into
         // one FC followed by the SwiGLU primitive.
         const bool ternocl_int2 = m_context->get_engine().runtime_type() == cldnn::runtime_types::ocl && !ov::util::getenv_bool("OV_TERNOCL_INT2_DISABLE");
         bool has_u2_weights = false;
         for (const auto& op : func->get_ops()) {
             const auto c = ov::as_type_ptr<ov::op::v0::Constant>(op);
-            if (c && c->get_element_type() == ov::element::u2) {
+            if (c && (c->get_element_type() == ov::element::u2 || c->get_element_type() == ov::element::u1)) {
                 has_u2_weights = true;
                 break;
             }

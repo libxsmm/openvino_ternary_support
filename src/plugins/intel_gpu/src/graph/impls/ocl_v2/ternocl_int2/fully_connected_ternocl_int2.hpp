@@ -70,7 +70,8 @@ inline int ternocl_int2_postop(const std::vector<fused_primitive_desc>& fused, b
 // TernOCL int2 x f16 up-convert OpenCL kernels (fp16 DPAS). OpenVINO has no
 // signed 2-bit type, so ternary weights arrive as u2 codes {0,1,2} plus a zero
 // point of 1; they are re-encoded to the kernel's {0,1,3} and packed once, when
-// the impl is created.
+// the impl is created. Binary weights {-s, +s} arrive as u1 bits with a zero
+// point of 1/2 and twice the scale, and run on the int1 kernels.
 struct TernoclInt2FCImplementationManager : public ImplementationManager {
     OV_GPU_PRIMITIVE_IMPL("TernoclInt2FCImplementationManager")
     TernoclInt2FCImplementationManager(shape_types shape_type, ValidateFunc vf = nullptr) : ImplementationManager(impl_types::ocl, shape_type, vf) {}
@@ -99,8 +100,13 @@ struct TernoclInt2FCImplementationManager : public ImplementationManager {
 
         if (!fc_prim->compressed_weights)
             TERNOCL_REJECT("not compressed_weights");
-        if (fc_node.weights().get_output_layout(false).data_type != data_types::u2)
-            TERNOCL_REJECT("weights are not u2");
+        const auto wei_dt = fc_node.weights().get_output_layout(false).data_type;
+        if (wei_dt != data_types::u2 && wei_dt != data_types::u1)
+            TERNOCL_REJECT("weights are not u2 or u1");
+        if (wei_dt == data_types::u1 && fc_prim->decompression_zero_point_scalar.has_value() && fc_prim->decompression_zero_point_scalar.value() != 0.5f)
+            TERNOCL_REJECT("u1 zero point is not 1/2");
+        if (wei_dt == data_types::u1 && !fc_prim->decompression_zero_point_scalar.has_value() && !fc_prim->decompression_zero_point.is_valid())
+            TERNOCL_REJECT("u1 weights without a zero point");
         if (!fc_node.weights().is_type<data>())
             TERNOCL_REJECT("weights are not a constant");
 
