@@ -223,6 +223,7 @@ SmallTile small_tile(size_t K, size_t N, size_t M, bool integrated, int bits) {
         size_t k, n, m;
         SmallTile s;
     };
+    // clang-format off
 #define G(sgm, wgn, ls, u) SmallTile{false, sgm, {wgn, ls, u}, {}}
 #define T(mm, mn, wm, wn) SmallTile{true, 0, {}, {mm, mn, wm, wn}}
     // Arc Pro B70, TernOCL bench (>= 2 GiB rotating weights), all validated.
@@ -251,16 +252,19 @@ SmallTile small_tile(size_t K, size_t N, size_t M, bool integrated, int bits) {
     };
 #undef G
 #undef T
+    // clang-format on
     const size_t m = M == 7 ? 8 : M;
     if (integrated) {
-        for (const auto& e : igpu)
+        for (const auto& e : igpu) {
             if (e.k == K && e.n == N && e.m == m)
                 return e.s;
+        }
         return s;
     }
-    for (const auto& e : table)
+    for (const auto& e : table) {
         if (e.k == K && e.n == N && e.m == m)
             return e.s;
+    }
     return s;
 }
 
@@ -469,7 +473,8 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
     std::array<Int8Launch, 4> _int8_launch;
     kernel::ptr _fwht;
 
-    fully_connected_ternocl_int2() : parent("ternocl_int2") {}
+    // The kernel name is what primitive_inst checks for the folded epilogue; a defaulted ctor would drop it.
+    fully_connected_ternocl_int2() : parent("ternocl_int2") {}  // NOLINT(modernize-use-equals-default)
     fully_connected_ternocl_int2(const ocl_engine& engine,
                                  TernoclInt2Packed own,
                                  size_t N,
