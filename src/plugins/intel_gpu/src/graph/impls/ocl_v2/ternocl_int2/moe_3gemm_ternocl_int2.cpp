@@ -55,6 +55,21 @@ struct MoETile {
 constexpr MoETile kGateUpTile{2, 4, 1};
 constexpr MoETile kDownTile{1, 1, 1};
 
+// From this many tokens the rows are grouped by expert and run as M-tiled GEMMs, which
+// read an expert's weights once per row tile rather than once per token.
+constexpr size_t kPrefillMinTokens = 16;
+
+// Prefill tiles (TernOCL int2_moe sweep_prefill.sh, Arc Pro B70): mt_m, mt_n, wg_m, wg_n.
+// Rows per tile (mt_m * wg_m) are shared by the three GEMMs of one launch set.
+struct MtTile {
+    int mt_m, mt_n, wg_m, wg_n;
+};
+constexpr std::array<MtTile, 3> kPrefillTiles = {MtTile{16, 32, 1, 8}, MtTile{32, 32, 1, 4}, MtTile{32, 32, 1, 8}};
+
+size_t prefill_band(size_t T) {
+    return T <= 64 ? 0 : (T <= 512 ? 1 : 2);
+}
+
 const program_node* const_source(const program_node* node) {
     while (node != nullptr && !node->is_type<data>()) {
         if (!node->is_type<reorder>() || node->get_dependencies().size() != 1)
@@ -109,15 +124,16 @@ void pack_experts(const uint8_t* src, uint32_t* dst, size_t E, size_t N, size_t 
     OPENVINO_ASSERT(!bad, "[GPU] ternocl int2 MoE: expert weights hold u2 code 3, outside the ternary range");
 }
 
-cl::Program get_program(const ocl_engine& engine, const std::string& opts) {
+cl::Program get_program(const ocl_engine& engine, const char* src, const std::string& opts) {
     static std::mutex m;
     static auto* cache = new std::map<std::string, cl::Program>;
-    const std::string key = std::to_string(reinterpret_cast<uintptr_t>(engine.get_cl_context().get())) + "|" + opts;
+    const std::string key =
+        std::to_string(reinterpret_cast<uintptr_t>(engine.get_cl_context().get())) + "|" + std::to_string(reinterpret_cast<uintptr_t>(src)) + "|" + opts;
     std::lock_guard<std::mutex> lock(m);
     auto it = cache->find(key);
     if (it != cache->end())
         return it->second;
-    cl::Program prog(engine.get_cl_context(), std::string(kTernoclMoeSource));
+    cl::Program prog(engine.get_cl_context(), std::string(src));
     try {
         prog.build(std::vector<cl::Device>{engine.get_cl_device()}, opts.c_str());
     } catch (const cl::Error&) {
@@ -163,25 +179,51 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
     size_t _hidden = 0;
     size_t _inter = 0;
     size_t _topk = 0;
+    size_t _experts = 0;
     kernel::ptr _gate_up, _down, _reduce;
+    struct Prefill {
+        kernel::ptr route, gather, up, gate, down, combine;
+    };
+    std::array<Prefill, kPrefillTiles.size()> _prefill;
 
     moe_3gemm_ternocl_int2() : parent("ternocl_int2_moe") {}
-    moe_3gemm_ternocl_int2(const ocl_engine& engine, std::array<memory::ptr, 3> scales, size_t hidden, size_t inter, size_t topk)
+    moe_3gemm_ternocl_int2(const ocl_engine& engine, std::array<memory::ptr, 3> scales, size_t hidden, size_t inter, size_t topk, size_t experts)
         : parent("ternocl_int2_moe"),
           _engine(&engine),
           _scales(std::move(scales)),
           _hidden(hidden),
           _inter(inter),
-          _topk(topk) {
+          _topk(topk),
+          _experts(experts) {
         const std::string base = "-cl-std=CL3.0 -DTOPK=" + std::to_string(topk);
         auto tile = [](const MoETile& t) {
             return " -DNSG_N=" + std::to_string(t.nsg) + " -DLS=" + std::to_string(t.ls) + " -DU=" + std::to_string(t.u);
         };
-        const auto gu = get_program(engine, base + tile(kGateUpTile));
-        const auto dn = get_program(engine, base + tile(kDownTile));
+        const auto gu = get_program(engine, kTernoclMoeSource, base + tile(kGateUpTile));
+        const auto dn = get_program(engine, kTernoclMoeSource, base + tile(kDownTile));
         _gate_up = make_kernel(engine, gu, "int2_moe_gate_up");
         _down = make_kernel(engine, dn, "int2_moe_down");
         _reduce = make_kernel(engine, dn, "int2_moe_reduce");
+    }
+
+    Prefill& get_prefill(size_t band) {
+        auto& p = _prefill[band];
+        if (p.up)
+            return p;
+        const auto& t = kPrefillTiles[band];
+        const std::string opts = "-cl-std=CL3.0 -DTOPK=" + std::to_string(_topk) + " -DNUM_EXPERTS=" + std::to_string(_experts) +
+                                 " -DMT_M=" + std::to_string(t.mt_m) + " -DMT_N=" + std::to_string(t.mt_n) + " -DWG_M=" + std::to_string(t.wg_m) +
+                                 " -DWG_N=" + std::to_string(t.wg_n) + " -cl-intel-256-GRF-per-thread";
+        const auto up = get_program(*_engine, kTernoclMoePrefillSource, opts);
+        const auto gate = get_program(*_engine, kTernoclMoePrefillSource, opts + " -DPOSTOP=1");
+        const auto down = get_program(*_engine, kTernoclMoePrefillSource, opts + " -DOUT_F32");
+        p.route = make_kernel(*_engine, up, "int2_moe_route");
+        p.gather = make_kernel(*_engine, up, "int2_moe_gather");
+        p.up = make_kernel(*_engine, up, "int2_moe_gemm_mt");
+        p.gate = make_kernel(*_engine, gate, "int2_moe_gemm_mt");
+        p.down = make_kernel(*_engine, down, "int2_moe_gemm_mt");
+        p.combine = make_kernel(*_engine, down, "int2_moe_combine");
+        return p;
     }
 
     std::unique_ptr<primitive_impl> clone() const override {
@@ -195,13 +237,23 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
         return false;
     }
 
-    // [T * TOPK, I] f16 SwiGLU output and [T * TOPK, H] f32 weighted expert outputs, from the memory pool.
+    // [G, I] f16 SwiGLU output and [G, H] f32 expert outputs (G = T * TOPK) from the memory pool; prefill
+    // adds the routing meta, permutation and inverse, expert-sorted activations and the up projection.
     std::vector<BufferDescriptor> get_internal_buffer_descs(const kernel_impl_params& params) const override {
         const auto& in = params.input_layouts[0];
         if (in.is_dynamic() || _hidden == 0)
             return {};
-        const size_t rows = ov::shape_size(in.get_shape()) / _hidden * _topk;
-        return {BufferDescriptor(rows * _inter, ov::element::f16), BufferDescriptor(rows * _hidden, ov::element::f32)};
+        const size_t T = ov::shape_size(in.get_shape()) / _hidden;
+        const size_t rows = T * _topk;
+        std::vector<BufferDescriptor> d = {BufferDescriptor(rows * _inter, ov::element::f16), BufferDescriptor(rows * _hidden, ov::element::f32)};
+        if (T >= kPrefillMinTokens) {
+            d.emplace_back(2 * _experts + 2, ov::element::i32);
+            d.emplace_back(rows, ov::element::i32);
+            d.emplace_back(rows, ov::element::i32);
+            d.emplace_back(rows * _hidden, ov::element::f16);
+            d.emplace_back(rows * _inter, ov::element::f16);
+        }
+        return d;
     }
 
 protected:
@@ -231,10 +283,92 @@ protected:
         return d;
     }
 
+    // every buffer as a positional argument, then the scalars
+    static kernel_arguments_desc bufs_desc(size_t n_bufs, size_t n_scalars, std::array<size_t, 2> global, std::array<size_t, 2> local) {
+        kernel_arguments_desc d;
+        d.workGroups.global = {global[0], global[1], 1};
+        d.workGroups.local = {local[0], local[1], 1};
+        for (size_t i = 0; i < n_bufs; ++i)
+            d.arguments.push_back({argument_desc::Types::INPUT, static_cast<uint32_t>(i)});
+        for (size_t i = 0; i < n_scalars; ++i)
+            d.arguments.push_back({argument_desc::Types::SCALAR, static_cast<uint32_t>(i)});
+        return d;
+    }
+
+    event::ptr launch(stream& stream,
+                      kernel& k,
+                      std::vector<memory::cptr> bufs,
+                      scalars_desc sc,
+                      std::array<size_t, 2> global,
+                      std::array<size_t, 2> local,
+                      const std::vector<event::ptr>& deps,
+                      bool is_output = false) {
+        const auto d = bufs_desc(bufs.size(), sc.size(), global, local);
+        kernel_arguments_data a;
+        a.inputs = std::move(bufs);
+        a.scalars = &sc;
+        stream.set_arguments(k, d, a);
+        return stream.enqueue_kernel(k, d, a, deps, is_output);
+    }
+
+    event::ptr execute_prefill(const std::vector<event::ptr>& events, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, size_t T) {
+        auto& stream = instance.get_network().get_stream();
+        const size_t G = T * _topk;
+        const auto band = prefill_band(T);
+        auto& p = get_prefill(band);
+        const auto& t = kPrefillTiles[band];
+        const auto& tmp = instance.get_intermediates_memories();
+        const auto &h = tmp.at(0), &y = tmp.at(1), &meta = tmp.at(2), &perm = tmp.at(3), &inv = tmp.at(4), &xs = tmp.at(5), &u = tmp.at(6);
+        const auto ids = instance.input_memory_ptr(idx(MoEIdx::topk_indices));
+
+        auto ev = launch(stream, *p.route, {ids, meta, perm, inv}, ints({G}), {1024, 1}, {1024, 1}, events);
+        ev = launch(stream, *p.gather, {instance.input_memory_ptr(idx(MoEIdx::hidden_states)), perm, xs}, ints({_hidden}), {256, G}, {256, 1}, {ev});
+
+        // row tiles: at most one partial tile per expert beyond the full ones
+        const size_t rows_per_tile = static_cast<size_t>(t.mt_m * t.wg_m);
+        const size_t tiles = ceil_div(G, rows_per_tile) + _experts;
+        const size_t wg = 16 * static_cast<size_t>(t.wg_m * t.wg_n);
+        auto grid = [&](size_t N) {
+            return std::array<size_t, 2>{ceil_div(N, static_cast<size_t>(t.mt_n * t.wg_n)) * wg, tiles};
+        };
+        // up; H = silu(gate) * up; Y = H . down (fp32); args: meta, A, B, S, C, Other, N, K
+        ev = launch(stream,
+                    *p.up,
+                    {meta, xs, instance.input_memory_ptr(idx(MoEIdx::weight_1)), _scales[1], u, xs},
+                    ints({_inter, _hidden}),
+                    grid(_inter),
+                    {wg, 1},
+                    {ev});
+        ev = launch(stream,
+                    *p.gate,
+                    {meta, xs, instance.input_memory_ptr(idx(MoEIdx::weight_0)), _scales[0], h, u},
+                    ints({_inter, _hidden}),
+                    grid(_inter),
+                    {wg, 1},
+                    {ev});
+        ev = launch(stream,
+                    *p.down,
+                    {meta, h, instance.input_memory_ptr(idx(MoEIdx::weight_2)), _scales[2], y, h},
+                    ints({_hidden, _inter}),
+                    grid(_hidden),
+                    {wg, 1},
+                    {ev});
+        return launch(stream,
+                      *p.combine,
+                      {y, inv, instance.input_memory_ptr(idx(MoEIdx::topk_weights)), instance.output_memory_ptr(0)},
+                      ints({_hidden}),
+                      {ceil_div(_hidden, 64) * 64, T},
+                      {64, 1},
+                      {ev},
+                      instance.is_output());
+    }
+
     event::ptr execute_impl(const std::vector<event::ptr>& events, typed_primitive_inst<moe_3gemm_fused_compressed>& instance) override {
         auto& stream = instance.get_network().get_stream();
         const auto& in_layout = instance.get_impl_params()->input_layouts[0];
         const size_t T = ov::shape_size(in_layout.get_shape()) / _hidden;
+        if (T >= kPrefillMinTokens)
+            return execute_prefill(events, instance, T);
         const size_t G = T * _topk;
         const auto& tmp = instance.get_intermediates_memories();
         const auto ids = instance.input_memory_ptr(idx(MoEIdx::topk_indices));
@@ -331,7 +465,7 @@ public:
             scales = moe_scales_cache().try_emplace(key, scales).first->second;
         }
         GPU_DEBUG_TRACE << "[ternocl-int2] create MoE " << node.id() << " E=" << E << " H=" << H << " I=" << I << " top_k=" << cfg.top_k << std::endl;
-        return std::make_unique<moe_3gemm_ternocl_int2>(downcast<const ocl_engine>(engine), scales, H, I, cfg.top_k);
+        return std::make_unique<moe_3gemm_ternocl_int2>(downcast<const ocl_engine>(engine), scales, H, I, cfg.top_k, E);
     }
 };
 
