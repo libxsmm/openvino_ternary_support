@@ -70,6 +70,14 @@ size_t prefill_band(size_t T) {
     return T <= 64 ? 0 : (T <= 512 ? 1 : 2);
 }
 
+// int8 prefill (GPU_TERNOCL_INT2_INT8_PREFILL): one tile for all T (sweep_prefill.sh --int8 0, Arc Pro B70).
+constexpr MtTile kPrefillInt8Tile{16, 64, 1, 4};
+
+// activation scale rows are padded to 32 (int2_int8_dpas.cl LDSA)
+size_t ldsa(size_t rows) {
+    return (rows + 31) & ~size_t{31};
+}
+
 const program_node* const_source(const program_node* node) {
     while (node != nullptr && !node->is_type<data>()) {
         if (!node->is_type<reorder>() || node->get_dependencies().size() != 1)
@@ -180,21 +188,24 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
     size_t _inter = 0;
     size_t _topk = 0;
     size_t _experts = 0;
+    bool _int8 = false;
     kernel::ptr _gate_up, _down, _reduce;
     struct Prefill {
-        kernel::ptr route, gather, up, gate, down, combine;
+        kernel::ptr route, gather, up, gate, down, combine, quant_x, quant_h;
     };
     std::array<Prefill, kPrefillTiles.size()> _prefill;
+    Prefill _prefill_int8;
 
     moe_3gemm_ternocl_int2() : parent("ternocl_int2_moe") {}
-    moe_3gemm_ternocl_int2(const ocl_engine& engine, std::array<memory::ptr, 3> scales, size_t hidden, size_t inter, size_t topk, size_t experts)
+    moe_3gemm_ternocl_int2(const ocl_engine& engine, std::array<memory::ptr, 3> scales, size_t hidden, size_t inter, size_t topk, size_t experts, bool int8)
         : parent("ternocl_int2_moe"),
           _engine(&engine),
           _scales(std::move(scales)),
           _hidden(hidden),
           _inter(inter),
           _topk(topk),
-          _experts(experts) {
+          _experts(experts),
+          _int8(int8) {
         const std::string base = "-cl-std=CL3.0 -DTOPK=" + std::to_string(topk);
         auto tile = [](const MoETile& t) {
             return " -DNSG_N=" + std::to_string(t.nsg) + " -DLS=" + std::to_string(t.ls) + " -DU=" + std::to_string(t.u);
@@ -207,22 +218,29 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
     }
 
     Prefill& get_prefill(size_t band) {
-        auto& p = _prefill[band];
+        auto& p = _int8 ? _prefill_int8 : _prefill[band];
         if (p.up)
             return p;
-        const auto& t = kPrefillTiles[band];
+        const auto& t = _int8 ? kPrefillInt8Tile : kPrefillTiles[band];
         const std::string opts = "-cl-std=CL3.0 -DTOPK=" + std::to_string(_topk) + " -DNUM_EXPERTS=" + std::to_string(_experts) +
                                  " -DMT_M=" + std::to_string(t.mt_m) + " -DMT_N=" + std::to_string(t.mt_n) + " -DWG_M=" + std::to_string(t.wg_m) +
-                                 " -DWG_N=" + std::to_string(t.wg_n) + " -cl-intel-256-GRF-per-thread";
-        const auto up = get_program(*_engine, kTernoclMoePrefillSource, opts);
-        const auto gate = get_program(*_engine, kTernoclMoePrefillSource, opts + " -DPOSTOP=1");
-        const auto down = get_program(*_engine, kTernoclMoePrefillSource, opts + " -DOUT_F32");
+                                 " -DWG_N=" + std::to_string(t.wg_n) + " -cl-intel-256-GRF-per-thread" +
+                                 (_int8 ? " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=0 -DWRITE_Q" : "");
+        const char* src = _int8 ? kTernoclMoePrefillInt8Source : kTernoclMoePrefillSource;
+        const char* gemm = _int8 ? "int2_moe_gemm_mt_i8" : "int2_moe_gemm_mt";
+        const auto up = get_program(*_engine, src, opts);
+        const auto gate = get_program(*_engine, src, opts + " -DPOSTOP=1");
+        const auto down = get_program(*_engine, src, opts + " -DOUT_F32");
         p.route = make_kernel(*_engine, up, "int2_moe_route");
-        p.gather = make_kernel(*_engine, up, "int2_moe_gather");
-        p.up = make_kernel(*_engine, up, "int2_moe_gemm_mt");
-        p.gate = make_kernel(*_engine, gate, "int2_moe_gemm_mt");
-        p.down = make_kernel(*_engine, down, "int2_moe_gemm_mt");
+        p.gather = make_kernel(*_engine, up, _int8 ? "int2_moe_gather_q" : "int2_moe_gather");
+        p.up = make_kernel(*_engine, up, gemm);
+        p.gate = make_kernel(*_engine, gate, gemm);
+        p.down = make_kernel(*_engine, down, gemm);
         p.combine = make_kernel(*_engine, down, "int2_moe_combine");
+        if (_int8) {
+            p.quant_x = make_kernel(*_engine, up, "quant_a");
+            p.quant_h = make_kernel(*_engine, up, "quant_a");
+        }
         return p;
     }
 
@@ -238,7 +256,8 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
     }
 
     // [G, I] f16 SwiGLU output and [G, H] f32 expert outputs (G = T * TOPK) from the memory pool; prefill
-    // adds the routing meta, permutation and inverse, expert-sorted activations and the up projection.
+    // adds the routing meta, permutation and inverse, expert-sorted activations and the up projection,
+    // and int8 prefill the int8 tokens, their scales, the sorted rows' scales and the int8 SwiGLU output.
     std::vector<BufferDescriptor> get_internal_buffer_descs(const kernel_impl_params& params) const override {
         const auto& in = params.input_layouts[0];
         if (in.is_dynamic() || _hidden == 0)
@@ -250,8 +269,16 @@ struct moe_3gemm_ternocl_int2 : typed_primitive_impl<moe_3gemm_fused_compressed>
             d.emplace_back(2 * _experts + 2, ov::element::i32);
             d.emplace_back(rows, ov::element::i32);
             d.emplace_back(rows, ov::element::i32);
-            d.emplace_back(rows * _hidden, ov::element::f16);
+            d.emplace_back(rows * _hidden, _int8 ? ov::element::i8 : ov::element::f16);
             d.emplace_back(rows * _inter, ov::element::f16);
+            if (_int8) {
+                const size_t gh = _hidden / kTernoclGroupSize, gi = _inter / kTernoclGroupSize;
+                d.emplace_back(T * _hidden, ov::element::i8);
+                d.emplace_back(gh * ldsa(T), ov::element::f16);
+                d.emplace_back(gh * ldsa(rows), ov::element::f16);
+                d.emplace_back(gi * ldsa(rows), ov::element::f16);
+                d.emplace_back(rows * _inter, ov::element::i8);
+            }
         }
         return d;
     }
@@ -316,13 +343,13 @@ protected:
         const size_t G = T * _topk;
         const auto band = prefill_band(T);
         auto& p = get_prefill(band);
-        const auto& t = kPrefillTiles[band];
+        const auto& t = _int8 ? kPrefillInt8Tile : kPrefillTiles[band];
         const auto& tmp = instance.get_intermediates_memories();
         const auto &h = tmp.at(0), &y = tmp.at(1), &meta = tmp.at(2), &perm = tmp.at(3), &inv = tmp.at(4), &xs = tmp.at(5), &u = tmp.at(6);
         const auto ids = instance.input_memory_ptr(idx(MoEIdx::topk_indices));
+        const auto x = instance.input_memory_ptr(idx(MoEIdx::hidden_states));
 
         auto ev = launch(stream, *p.route, {ids, meta, perm, inv}, ints({G}), {1024, 1}, {1024, 1}, events);
-        ev = launch(stream, *p.gather, {instance.input_memory_ptr(idx(MoEIdx::hidden_states)), perm, xs}, ints({_hidden}), {256, G}, {256, 1}, {ev});
 
         // row tiles: at most one partial tile per expert beyond the full ones
         const size_t rows_per_tile = static_cast<size_t>(t.mt_m * t.wg_m);
@@ -331,6 +358,51 @@ protected:
         auto grid = [&](size_t N) {
             return std::array<size_t, 2>{ceil_div(N, static_cast<size_t>(t.mt_n * t.wg_n)) * wg, tiles};
         };
+        const auto combine = [&](event::ptr dep) {
+            return launch(stream,
+                          *p.combine,
+                          {y, inv, instance.input_memory_ptr(idx(MoEIdx::topk_weights)), instance.output_memory_ptr(0)},
+                          ints({_hidden}),
+                          {ceil_div(_hidden, 64) * 64, T},
+                          {64, 1},
+                          {dep},
+                          instance.is_output());
+        };
+
+        if (_int8) {
+            // xs holds the int8 sorted rows; A (fp16) is unused in QMODE 0
+            const auto &xq = tmp.at(7), &sa_t = tmp.at(8), &sa_x = tmp.at(9), &sa_h = tmp.at(10), &hq = tmp.at(11);
+            const size_t gk = kTernoclGroupSize / 16;
+            // quant_a(A, SA, Aq, M, K): the T tokens once, before the gather duplicates them TOPK times
+            ev = launch(stream, *p.quant_x, {x, sa_t, xq}, ints({T, _hidden}), {_hidden / gk, T}, {16, 1}, {ev});
+            ev = launch(stream, *p.gather, {xq, sa_t, perm, xs, sa_x}, ints({T, G, _hidden}), {256, G}, {256, 1}, {ev});
+            // args: meta, A, Aq, SA, B, SB, C, Other, G, N, K
+            ev = launch(stream,
+                        *p.up,
+                        {meta, h, xs, sa_x, instance.input_memory_ptr(idx(MoEIdx::weight_1)), _scales[1], u, u},
+                        ints({G, _inter, _hidden}),
+                        grid(_inter),
+                        {wg, 1},
+                        {ev});
+            ev = launch(stream,
+                        *p.gate,
+                        {meta, h, xs, sa_x, instance.input_memory_ptr(idx(MoEIdx::weight_0)), _scales[0], h, u},
+                        ints({G, _inter, _hidden}),
+                        grid(_inter),
+                        {wg, 1},
+                        {ev});
+            ev = launch(stream, *p.quant_h, {h, sa_h, hq}, ints({G, _inter}), {_inter / gk, G}, {16, 1}, {ev});
+            ev = launch(stream,
+                        *p.down,
+                        {meta, h, hq, sa_h, instance.input_memory_ptr(idx(MoEIdx::weight_2)), _scales[2], y, h},
+                        ints({G, _hidden, _inter}),
+                        grid(_hidden),
+                        {wg, 1},
+                        {ev});
+            return combine(ev);
+        }
+
+        ev = launch(stream, *p.gather, {x, perm, xs}, ints({_hidden}), {256, G}, {256, 1}, {ev});
         // up; H = silu(gate) * up; Y = H . down (fp32); args: meta, A, B, S, C, Other, N, K
         ev = launch(stream,
                     *p.up,
@@ -353,14 +425,7 @@ protected:
                     grid(_hidden),
                     {wg, 1},
                     {ev});
-        return launch(stream,
-                      *p.combine,
-                      {y, inv, instance.input_memory_ptr(idx(MoEIdx::topk_weights)), instance.output_memory_ptr(0)},
-                      ints({_hidden}),
-                      {ceil_div(_hidden, 64) * 64, T},
-                      {64, 1},
-                      {ev},
-                      instance.is_output());
+        return combine(ev);
     }
 
     event::ptr execute_impl(const std::vector<event::ptr>& events, typed_primitive_inst<moe_3gemm_fused_compressed>& instance) override {
@@ -464,8 +529,15 @@ public:
             std::lock_guard<std::mutex> lock(moe_mutex());
             scales = moe_scales_cache().try_emplace(key, scales).first->second;
         }
-        GPU_DEBUG_TRACE << "[ternocl-int2] create MoE " << node.id() << " E=" << E << " H=" << H << " I=" << I << " top_k=" << cfg.top_k << std::endl;
-        return std::make_unique<moe_3gemm_ternocl_int2>(downcast<const ocl_engine>(engine), scales, H, I, cfg.top_k, E);
+        GPU_DEBUG_TRACE << "[ternocl-int2] create MoE " << node.id() << " E=" << E << " H=" << H << " I=" << I << " top_k=" << cfg.top_k
+                        << " int8_prefill=" << prog.get_config().get_ternocl_int2_int8_prefill() << std::endl;
+        return std::make_unique<moe_3gemm_ternocl_int2>(downcast<const ocl_engine>(engine),
+                                                        scales,
+                                                        H,
+                                                        I,
+                                                        cfg.top_k,
+                                                        E,
+                                                        prog.get_config().get_ternocl_int2_int8_prefill());
     }
 };
 

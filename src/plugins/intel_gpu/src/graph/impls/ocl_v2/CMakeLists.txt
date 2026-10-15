@@ -59,7 +59,8 @@ set(TERNOCL_FILES "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl"
                   "${TERNOCL_ROOT}/common/epilogue.clh"
                   "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl"
                   "${TERNOCL_ROOT}/int2_moe/int2_moe.cl"
-                  "${TERNOCL_ROOT}/int2_moe/int2_moe_prefill.cl")
+                  "${TERNOCL_ROOT}/int2_moe/int2_moe_prefill.cl"
+                  "${TERNOCL_ROOT}/int2_moe/int2_moe_prefill_int8.cl")
 foreach(f IN LISTS TERNOCL_FILES)
     if(NOT EXISTS "${f}")
         message(FATAL_ERROR "TernOCL kernel ${f} not found: run `git submodule update --init "
@@ -89,14 +90,17 @@ file(READ "${TERNOCL_ROOT}/int2_moe/int2_moe.cl" TERNOCL_MOE)
 string(REPLACE "#include \"int2_fp16_upcvt.cl\"" "${TERNOCL_UPCVT}" TERNOCL_MOE "${TERNOCL_MOE}")
 file(READ "${TERNOCL_ROOT}/int2_moe/int2_moe_prefill.cl" TERNOCL_MOE_PREFILL)
 string(REPLACE "#include \"int2_fp16_upcvt.cl\"" "${TERNOCL_UPCVT}" TERNOCL_MOE_PREFILL "${TERNOCL_MOE_PREFILL}")
+file(READ "${TERNOCL_ROOT}/int2_moe/int2_moe_prefill_int8.cl" TERNOCL_MOE_PREFILL_INT8)
+string(REPLACE "#include \"int2_int8_dpas.cl\"" "${TERNOCL_INT8}" TERNOCL_MOE_PREFILL_INT8 "${TERNOCL_MOE_PREFILL_INT8}")
 ternocl_literal(TERNOCL_UPCVT_LIT kTernoclUpcvtSource "${TERNOCL_UPCVT}")
 ternocl_literal(TERNOCL_INT8_LIT kTernoclInt8Source "${TERNOCL_INT8}")
 ternocl_literal(TERNOCL_FWHT_LIT kTernoclFwhtSource "${TERNOCL_FWHT}")
 ternocl_literal(TERNOCL_MOE_LIT kTernoclMoeSource "${TERNOCL_MOE}")
 ternocl_literal(TERNOCL_MOE_PREFILL_LIT kTernoclMoePrefillSource "${TERNOCL_MOE_PREFILL}")
+ternocl_literal(TERNOCL_MOE_PREFILL_INT8_LIT kTernoclMoePrefillInt8Source "${TERNOCL_MOE_PREFILL_INT8}")
 file(WRITE "${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc"
      "// Generated from ${TERNOCL_ROOT} by impls/ocl_v2/CMakeLists.txt; do not edit.\n#pragma once\n"
-     "${TERNOCL_UPCVT_LIT}${TERNOCL_INT8_LIT}${TERNOCL_FWHT_LIT}${TERNOCL_MOE_LIT}${TERNOCL_MOE_PREFILL_LIT}")
+     "${TERNOCL_UPCVT_LIT}${TERNOCL_INT8_LIT}${TERNOCL_FWHT_LIT}${TERNOCL_MOE_LIT}${TERNOCL_MOE_PREFILL_LIT}${TERNOCL_MOE_PREFILL_INT8_LIT}")
 configure_file("${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc" "${CODEGEN_INCDIR}/ternocl_int2_kernels.inc" COPYONLY)
 
 ov_gpu_add_backend_target(
