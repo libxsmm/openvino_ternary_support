@@ -296,14 +296,24 @@ def main():
     folded: set[str] = set()
     signs: dict[int, np.ndarray] = {}
     block = 0
-    if int(fields.get("prism.hadamard.version", 0)) == 1 and not a.no_hadamard:
+    # A tied model (no output.weight) reads its LM head from the token embedding.
+    head = "output.weight" if "output.weight" in tensors else "token_embd.weight"
+    version = int(fields.get("prism.hadamard.version", 0))
+    if version in (1, 2) and not a.no_hadamard:
+        tied = bool(fields.get("prism.hadamard.tied_output", False))
         if fields["prism.hadamard.transform"] != "normalized-sylvester-walsh-hadamard" \
                 or fields["prism.hadamard.axis"] != "input-last-dimension" \
                 or fields["prism.hadamard.sign_mode"] != "explicit" \
-                or not fields.get("prism.hadamard.gdn_v_grouped", False):
+                or (version == 2) != tied or tied != (head == "token_embd.weight") \
+                or (nv != nk and not v_grouped):
             sys.exit("unexpected prism.hadamard contract")
         block = int(fields["prism.hadamard.block_size"])
+        if block <= 0 or block & (block - 1):
+            sys.exit(f"Hadamard block {block} is not a power of two")
         folded = set(fields["prism.hadamard.weight_names"])
+        if tied:
+            # version 2: the stored (rotated) embedding rows are also the folded LM head
+            folded.add(head)
         inverse = set(fields.get("prism.hadamard.inverse_weight_names", []))
         if inverse != {"token_embd.weight"}:
             sys.exit(f"unexpected inverse set {inverse}")
@@ -339,7 +349,7 @@ def main():
     k_of = {}               # hf module -> K
     for hf, mm in sorted(matmuls.items()):
         if hf == "lm_head":
-            gname, leaf, layer = "output.weight", "lm_head", -1
+            gname, leaf, layer = head, "lm_head", -1
         else:
             lm = layer_re.match(hf)
             if not lm:
@@ -498,7 +508,7 @@ def main():
     # ---- Hadamard rotation ---------------------------------------------------
     if folded and not a.verify:
         H = ops.constant(hadamard(block).astype(np.float32))
-        H.set_friendly_name("hadamard.H1024")
+        H.set_friendly_name(f"hadamard.H{block}")
         n_rot = n_sign_mul = n_norm_fold = 0
         rotated_outputs = {}    # producer output -> rotated output (shared)
 
@@ -522,7 +532,7 @@ def main():
 
         for hf, mm in sorted(matmuls.items()):
             if hf == "lm_head":
-                gname, layer, leaf = "output.weight", -1, "lm_head"
+                gname, layer, leaf = head, -1, "lm_head"
             else:
                 lm = layer_re.match(hf)
                 layer, leaf = int(lm.group(1)), lm.group(2)
