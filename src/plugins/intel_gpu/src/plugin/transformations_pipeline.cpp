@@ -694,10 +694,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         // Gated on supports_immad (systolic-only) and oneDNN (required for expert GEMM dispatch).
         // Note: even though we are already inside `if (supports_immad)`, oneDNN can still be explicitly disabled by the user.
         if (device_info.supports_immad && config.get_use_onednn() && !config.get_moe_disable_fusion()) {
-            const std::vector<ov::element::Type> supported_compressed_weights_types{ov::element::u4,
-                                                                                    ov::element::i4,
-                                                                                    ov::element::i8,
-                                                                                    ov::element::u8};
+            std::vector<ov::element::Type> supported_compressed_weights_types{ov::element::u4,
+                                                                              ov::element::i4,
+                                                                              ov::element::i8,
+                                                                              ov::element::u8};
+            // Ternary experts run on the TernOCL MoE impl, the only one that accepts u2.
+            if (m_context->get_engine().runtime_type() == cldnn::runtime_types::ocl && config.get_enable_ternocl_int2() &&
+                device_info.arch >= cldnn::gpu_arch::xe2)
+                supported_compressed_weights_types.push_back(ov::element::u2);
             manager.register_pass<ov::pass::ConvertGroupedMatMulToGroupedMatMulCompressed>(
                 supported_compressed_weights_types);
             manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>(supported_compressed_weights_types);

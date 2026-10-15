@@ -57,7 +57,8 @@ set(TERNOCL_ROOT "${TERNOCL_ROOT}" CACHE PATH "TernOCL kernel collection used by
 set(TERNOCL_FILES "${TERNOCL_ROOT}/int2_fp16_upcvt/int2_fp16_upcvt.cl"
                   "${TERNOCL_ROOT}/int2_via_int2_x_int8_dpas/int2_int8_dpas.cl"
                   "${TERNOCL_ROOT}/common/epilogue.clh"
-                  "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl")
+                  "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl"
+                  "${TERNOCL_ROOT}/int2_moe/int2_moe.cl")
 foreach(f IN LISTS TERNOCL_FILES)
     if(NOT EXISTS "${f}")
         message(FATAL_ERROR "TernOCL kernel ${f} not found: run `git submodule update --init "
@@ -83,12 +84,15 @@ string(REPLACE "#include \"epilogue.clh\"" "${TERNOCL_EPILOGUE}" TERNOCL_UPCVT "
 file(READ "${TERNOCL_ROOT}/int2_via_int2_x_int8_dpas/int2_int8_dpas.cl" TERNOCL_INT8)
 string(REPLACE "#include \"epilogue.clh\"" "${TERNOCL_EPILOGUE}" TERNOCL_INT8 "${TERNOCL_INT8}")
 file(READ "${TERNOCL_ROOT}/hadamard/hadamard_fwht.cl" TERNOCL_FWHT)
+file(READ "${TERNOCL_ROOT}/int2_moe/int2_moe.cl" TERNOCL_MOE)
+string(REPLACE "#include \"int2_fp16_upcvt.cl\"" "${TERNOCL_UPCVT}" TERNOCL_MOE "${TERNOCL_MOE}")
 ternocl_literal(TERNOCL_UPCVT_LIT kTernoclUpcvtSource "${TERNOCL_UPCVT}")
 ternocl_literal(TERNOCL_INT8_LIT kTernoclInt8Source "${TERNOCL_INT8}")
 ternocl_literal(TERNOCL_FWHT_LIT kTernoclFwhtSource "${TERNOCL_FWHT}")
+ternocl_literal(TERNOCL_MOE_LIT kTernoclMoeSource "${TERNOCL_MOE}")
 file(WRITE "${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc"
      "// Generated from ${TERNOCL_ROOT} by impls/ocl_v2/CMakeLists.txt; do not edit.\n#pragma once\n"
-     "${TERNOCL_UPCVT_LIT}${TERNOCL_INT8_LIT}${TERNOCL_FWHT_LIT}")
+     "${TERNOCL_UPCVT_LIT}${TERNOCL_INT8_LIT}${TERNOCL_FWHT_LIT}${TERNOCL_MOE_LIT}")
 configure_file("${CODEGEN_CACHE_DIR}/ternocl_int2_kernels.inc" "${CODEGEN_INCDIR}/ternocl_int2_kernels.inc" COPYONLY)
 
 ov_gpu_add_backend_target(
