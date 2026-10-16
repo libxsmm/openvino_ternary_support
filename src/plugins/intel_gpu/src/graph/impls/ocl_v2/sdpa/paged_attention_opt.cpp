@@ -192,6 +192,10 @@ static int64_t get_aligned_seq_len(const kernel_impl_params& impl_param, const P
         } else {
             aligned_seq_len = calculate_aligned_seq_len();
         }
+    } else if (stage == PagedAttentionStage::GENERATE) {
+        // One token per sequence.
+        const auto& past_lens_ps = impl_param.get_input_layout(PagedAttentionInputIdx::PAST_LENS).get_partial_shape();
+        aligned_seq_len = past_lens_ps[0].get_length() * target_seq_len_block_size;
     } else {
         aligned_seq_len = calculate_aligned_seq_len();
     }
@@ -1548,6 +1552,14 @@ public:
 
         update_stages_flags(instance);
         kernel_dump_info.clear_entries();
+        // A static network never calls update(): size the dispatch once from the fixed shapes.
+        if (m_rt_params == nullptr && !params.is_dynamic()) {
+            update_rt_params(instance);
+            for (auto& stage : _stages) {
+                stage->kd.need_dispatch_data_update = true;
+                stage->kd.need_args_update = true;
+            }
+        }
         auto* rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
         assert(rt_params != nullptr);
         prepare_internal_buffers(static_cast<paged_attention_inst&>(instance), rt_params->stage, rt_params->use_micro_sdpa, rt_params->query_block_size);
