@@ -91,20 +91,28 @@ ConvertPagedAttnInputs::ConvertPagedAttnInputs(const KVCacheConfig& config,
             enable_keep_const_precision(value_cache);
             if (pa_op->get_rt_info().count("num_k_heads") && pa_op->get_rt_info().count("k_head_size") &&
                 pa_op->get_rt_info().count("num_v_heads") && pa_op->get_rt_info().count("v_head_size")) {
-                const auto key_cache_shape = init_cache_shape(pa_op->get_rt_info()["num_k_heads"].as<size_t>(),
-                                                              pa_op->get_rt_info()["k_head_size"].as<size_t>(),
-                                                              m_config.keyCacheBlockSize,
-                                                              key_cache_precision,
-                                                              m_config.keyCacheGroupSize,
-                                                              m_config.keyCacheQuantBychannel,
-                                                              m_config.keyCacheDimOrder);
-                const auto value_cache_shape = init_cache_shape(pa_op->get_rt_info()["num_v_heads"].as<size_t>(),
-                                                                pa_op->get_rt_info()["v_head_size"].as<size_t>(),
-                                                                m_config.valueCacheBlockSize,
-                                                                value_cache_precision,
-                                                                m_config.valueCacheGroupSize,
-                                                                m_config.valueCacheQuantBychannel,
-                                                                m_config.valueCacheDimOrder);
+                auto key_cache_shape = init_cache_shape(pa_op->get_rt_info()["num_k_heads"].as<size_t>(),
+                                                        pa_op->get_rt_info()["k_head_size"].as<size_t>(),
+                                                        m_config.keyCacheBlockSize,
+                                                        key_cache_precision,
+                                                        m_config.keyCacheGroupSize,
+                                                        m_config.keyCacheQuantBychannel,
+                                                        m_config.keyCacheDimOrder);
+                auto value_cache_shape = init_cache_shape(pa_op->get_rt_info()["num_v_heads"].as<size_t>(),
+                                                          pa_op->get_rt_info()["v_head_size"].as<size_t>(),
+                                                          m_config.valueCacheBlockSize,
+                                                          value_cache_precision,
+                                                          m_config.valueCacheGroupSize,
+                                                          m_config.valueCacheQuantBychannel,
+                                                          m_config.valueCacheDimOrder);
+                // A caller compiling a static graph pins the block count on the Parameter.
+                auto pin_blocks = [](const std::shared_ptr<v0::Parameter>& cache, ov::PartialShape& shape, const std::vector<size_t>& orders) {
+                    const auto it = cache->get_rt_info().find("num_blocks");
+                    if (it != cache->get_rt_info().end())
+                        shape[orders[0]] = it->second.as<int64_t>();
+                };
+                pin_blocks(key_cache, key_cache_shape, m_config.keyCacheDimOrder);
+                pin_blocks(value_cache, value_cache_shape, m_config.valueCacheDimOrder);
 
                 key_cache->set_partial_shape(key_cache_shape);
                 value_cache->set_partial_shape(value_cache_shape);

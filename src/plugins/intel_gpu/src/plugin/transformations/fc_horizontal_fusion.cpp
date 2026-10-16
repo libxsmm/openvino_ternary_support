@@ -59,7 +59,8 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
 
         const auto& fc = ov::as_type_ptr<op::FullyConnectedCompressed>(output.get_node_shared_ptr());
         const auto& input = fc->get_input_node_shared_ptr(0);
-        if (!fc->get_input_partial_shape(0).is_dynamic()) {
+        // u2 (ternary) checkpoints need the merge in static graphs too: TernOCL has no epilogue for a lone gate_proj.
+        if (!fc->get_input_partial_shape(0).is_dynamic() && fc->get_input_element_type(1) != ov::element::u2) {
             return false;
         }
         size_t user_fc_count = 0;
