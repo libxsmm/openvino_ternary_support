@@ -1104,25 +1104,29 @@ void network::prepare_record_replay() {
         // Only safe when recording iteration produces self-contained GPU command stream that remains valid across iterations.
 
         // Event/barrier based synchronization can cause hangs during replay
-        if (_stream->get_queue_type() != QueueTypes::in_order || _stream->get_sync_method() != cldnn::SyncMethods::none)
+        if (_stream->get_queue_type() != QueueTypes::in_order || _stream->get_sync_method() != cldnn::SyncMethods::none) {
+            GPU_DEBUG_INFO << "[record_replay] unsupported: queue type or sync method" << std::endl;
             return false;
+        }
 
         // When model is dynamic it is not safe to fully skip prepare_primitive and execute logic on replay iterations
-        if (_is_dynamic)
+        if (_is_dynamic) {
+            GPU_DEBUG_INFO << "[record_replay] unsupported: dynamic network" << std::endl;
             return false;
+        }
         // Variable state might invalidate recording when updated
-        if (!_variables_state_info.empty())
+        if (!_variables_state_info.empty()) {
+            GPU_DEBUG_INFO << "[record_replay] unsupported: network has variables" << std::endl;
             return false;
+        }
         for (const auto& inst : _exec_order) {
             // Inner network execution (loop/condition primitives) is based on host-side logic
-            if (inst->has_inner_networks())
-                return false;
-            // Check for any implementations that are not replay safe
             const auto* impl = inst->get_impl();
-            if (impl == nullptr)
+            if (inst->has_inner_networks() || impl == nullptr || !impl->supports_replay()) {
+                GPU_DEBUG_INFO << "[record_replay] unsupported primitive: " << inst->id() << " impl=" << (impl ? impl->get_kernel_name() : "none")
+                               << std::endl;
                 return false;
-            if (!impl->supports_replay())
-                return false;
+            }
         }
         return true;
     };
