@@ -6729,7 +6729,8 @@ std::ostream& operator<<(std::ostream& os, const ternary_fc_params& p) {
 
 bool ternocl_int2_supported(engine& engine) {
     const auto& info = engine.get_device_info();
-    return engine.runtime_type() == runtime_types::ocl && info.arch >= gpu_arch::xe2 && info.supports_immad;
+    return (engine.runtime_type() == runtime_types::ocl || engine.runtime_type() == runtime_types::ze) && info.arch >= gpu_arch::xe2 &&
+           info.supports_immad;
 }
 
 // Normalised Sylvester H_b applied to s * x, per b-wide block of every row.

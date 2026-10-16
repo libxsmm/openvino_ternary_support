@@ -1746,7 +1746,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         // Ternary (u2) checkpoints on the TernOCL path run faster with gate/up merged into
         // one FC followed by the SwiGLU primitive.
-        const bool ternocl_int2 = m_context->get_engine().runtime_type() == cldnn::runtime_types::ocl && config.get_enable_ternocl_int2() &&
+        const auto rt_type = m_context->get_engine().runtime_type();
+        const bool ternocl_int2 = (rt_type == cldnn::runtime_types::ocl || rt_type == cldnn::runtime_types::ze) && config.get_enable_ternocl_int2() &&
                                   device_info.arch >= cldnn::gpu_arch::xe2 && device_info.supports_immad;
         bool has_u2_weights = false;
         for (const auto& op : func->get_ops()) {

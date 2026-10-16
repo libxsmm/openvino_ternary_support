@@ -4,32 +4,31 @@
 
 #include "fully_connected_ternocl_int2.hpp"
 
-#ifdef OV_GPU_WITH_OCL_RT
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
-#    include <array>
-#    include <atomic>
-#    include <cmath>
-#    include <cstdint>
-#    include <cstdio>
-#    include <cstdlib>
-#    include <iostream>
-#    include <map>
-#    include <mutex>
-#    include <sstream>
-#    include <unordered_map>
-#    include <vector>
-
-#    include "data_inst.h"
-#    include "fully_connected_inst.h"
-#    include "intel_gpu/runtime/debug_configuration.hpp"
-#    include "intel_gpu/runtime/kernel_args.hpp"
-#    include "intel_gpu/runtime/memory.hpp"
-#    include "primitive_inst.h"
-#    include "registry/registry.hpp"
-#    include "reorder_inst.h"
-#    include "runtime/ocl/ocl_engine.hpp"
-#    include "runtime/ocl/ocl_kernel.hpp"
-#    include "ternocl_int2_kernels.inc"  // generated from TERNOCL_ROOT (CMakeLists.txt)
+#include "data_inst.h"
+#include "fully_connected_inst.h"
+#include "intel_gpu/runtime/debug_configuration.hpp"
+#include "intel_gpu/runtime/engine.hpp"
+#include "intel_gpu/runtime/kernel_args.hpp"
+#include "intel_gpu/runtime/kernel_builder.hpp"
+#include "intel_gpu/runtime/memory.hpp"
+#include "primitive_inst.h"
+#include "registry/registry.hpp"
+#include "reorder_inst.h"
+#include "ternocl_int2_kernels.inc"  // generated from TERNOCL_ROOT (CMakeLists.txt)
 
 namespace cldnn {
 namespace ocl {
@@ -235,29 +234,26 @@ MtTile int8_tile(size_t K, size_t N, size_t M) {
 }
 
 // ---------------------------------------------------------------------------
-// Programs are built once per (context, source, options) and shared; every impl
-// creates its own cl_kernel from them so argument state is never shared.
-cl::Program get_program(const ocl_engine& engine, const char* src, const std::string& opts) {
+// Programs are built once per (context, source, options) through the engine's kernel builder
+// (OpenCL or Level Zero); every impl clones its own kernel so argument state is never shared.
+kernel::ptr make_kernel(const engine& engine, const char* src, const std::string& opts, const char* name) {
     static std::mutex m;
-    static auto* cache = new std::map<std::string, cl::Program>;
-    const std::string key =
-        std::to_string(reinterpret_cast<uintptr_t>(engine.get_cl_context().get())) + "|" + std::to_string(reinterpret_cast<uintptr_t>(src)) + "|" + opts;
+    static auto* cache = new std::map<std::string, std::vector<kernel::ptr>>;
+    const std::string key = std::to_string(reinterpret_cast<uintptr_t>(engine.get_user_context(engine.runtime_type()))) + "|" +
+                            std::to_string(reinterpret_cast<uintptr_t>(src)) + "|" + opts;
     std::lock_guard<std::mutex> lock(m);
     auto it = cache->find(key);
-    if (it != cache->end())
-        return it->second;
-    cl::Program prog(engine.get_cl_context(), std::string(src));
-    try {
-        prog.build(std::vector<cl::Device>{engine.get_cl_device()}, opts.c_str());
-    } catch (const cl::Error&) {
-        OPENVINO_THROW("[GPU] ternocl int2: kernel build failed (", opts, "):\n", prog.getBuildInfo<CL_PROGRAM_BUILD_LOG>(engine.get_cl_device()));
+    if (it == cache->end()) {
+        std::vector<kernel::ptr> kernels;
+        engine.create_kernel_builder()->build_kernels(src, std::strlen(src), KernelFormat::SOURCE, opts, kernels);
+        GPU_DEBUG_TRACE_DETAIL << "[ternocl-int2] built " << opts << std::endl;
+        it = cache->emplace(key, std::move(kernels)).first;
     }
-    GPU_DEBUG_TRACE_DETAIL << "[ternocl-int2] built " << opts << std::endl;
-    return cache->emplace(key, prog).first->second;
-}
-
-kernel::ptr make_kernel(const ocl_engine& engine, const cl::Program& prog, const char* name) {
-    return std::make_shared<ocl_kernel>(ocl_kernel_type(cl::Kernel(prog, name), engine.get_usm_helper()), name);
+    for (const auto& k : it->second) {
+        if (k->get_id() == name)
+            return k->clone(false);
+    }
+    OPENVINO_THROW("[GPU] ternocl int2: kernel ", name, " not found in the program built with ", opts);
 }
 
 size_t ceil_div(size_t a, size_t b) {
@@ -300,7 +296,7 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
 
     DECLARE_OBJECT_TYPE_SERIALIZATION(cldnn::ocl::fully_connected_ternocl_int2)
 
-    const ocl_engine* _engine = nullptr;
+    const engine* _engine = nullptr;
     TernoclInt2Packed _own;  // fallback when the node-id lookup misses
     size_t _N = 0;
     size_t _K = 0;
@@ -328,7 +324,7 @@ struct fully_connected_ternocl_int2 : typed_primitive_impl<fully_connected> {
     kernel::ptr _fwht;
 
     fully_connected_ternocl_int2() : parent("ternocl_int2") {}
-    fully_connected_ternocl_int2(const ocl_engine& engine,
+    fully_connected_ternocl_int2(const engine& engine,
                                  TernoclInt2Packed own,
                                  size_t N,
                                  size_t K,
@@ -402,12 +398,12 @@ protected:
             l.g = gemv_tile(_K, _N, _integrated);
             opts += " -DSGM=" + std::to_string(sgm) + " -DNSG_N=" + std::to_string(l.g.wgn / 16) + " -DLS=" + std::to_string(l.g.ls) +
                     " -DU=" + std::to_string(l.g.u) + " -DPF=0";
-            l.k = make_kernel(*_engine, get_program(*_engine, kTernoclUpcvtSource, opts + epi_opts()), "int2_fp16_upcvt_gemm");
+            l.k = make_kernel(*_engine, kTernoclUpcvtSource, opts + epi_opts(), "int2_fp16_upcvt_gemm");
         } else {
             l.t = mt_tile(_K, _N, M, _integrated);
             opts += " -DMT_M=" + std::to_string(l.t.mt_m) + " -DMT_N=" + std::to_string(l.t.mt_n) + " -DWG_M=" + std::to_string(l.t.wg_m) +
                     " -DWG_N=" + std::to_string(l.t.wg_n) + " -cl-intel-256-GRF-per-thread";
-            l.k = make_kernel(*_engine, get_program(*_engine, kTernoclUpcvtSource, opts + epi_opts()), "int2_fp16_upcvt_gemm_mt");
+            l.k = make_kernel(*_engine, kTernoclUpcvtSource, opts + epi_opts(), "int2_fp16_upcvt_gemm_mt");
         }
         GPU_DEBUG_TRACE_DETAIL << "[ternocl-int2] K=" << _K << " N=" << _N << " M-class " << launch_class(M) << ": " << opts << epi_opts() << std::endl;
         return l;
@@ -421,9 +417,8 @@ protected:
         const std::string opts = "-cl-std=CL3.0 -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1 -DMT_M=" + std::to_string(l.t.mt_m) +
                                  " -DMT_N=" + std::to_string(l.t.mt_n) + " -DWG_M=" + std::to_string(l.t.wg_m) + " -DWG_N=" + std::to_string(l.t.wg_n) +
                                  " -cl-intel-256-GRF-per-thread" + epi_opts();
-        const auto prog = get_program(*_engine, kTernoclInt8Source, opts);
-        l.quant = make_kernel(*_engine, prog, "quant_a");
-        l.gemm = make_kernel(*_engine, prog, "int2_int8_gemm_mt");
+        l.quant = make_kernel(*_engine, kTernoclInt8Source, opts, "quant_a");
+        l.gemm = make_kernel(*_engine, kTernoclInt8Source, opts, "int2_int8_gemm_mt");
         GPU_DEBUG_TRACE_DETAIL << "[ternocl-int2] K=" << _K << " N=" << _N << " M-class " << launch_class(M) << " int8: " << opts << std::endl;
         return l;
     }
@@ -510,7 +505,7 @@ protected:
             // Rotated-basis checkpoint: the GEMM consumes H_B(s * x) / sqrt(B).
             const auto& rotated = instance.get_intermediates_memories().at(0);
             if (!_fwht)
-                _fwht = make_kernel(*_engine, get_program(*_engine, kTernoclFwhtSource, "-cl-std=CL3.0 -DHB=" + std::to_string(_had_block)), "hadamard_fwht");
+                _fwht = make_kernel(*_engine, kTernoclFwhtSource, "-cl-std=CL3.0 -DHB=" + std::to_string(_had_block), "hadamard_fwht");
             kernel_arguments_desc d;
             d.workGroups.global = {M * (_K / _had_block) * (_had_block / 8), 1, 1};
             d.workGroups.local = {_had_block / 8, 1, 1};
@@ -684,7 +679,7 @@ public:
         GPU_DEBUG_TRACE << "[ternocl-int2] create " << arg.id() << " N=" << N << " K=" << K << " postop=" << static_cast<int>(*postop) << " out_f32=" << out_f32
                         << " hadamard=" << desc->hadamard_block << " int8_prefill=" << int8 << std::endl;
 
-        return std::make_unique<fully_connected_ternocl_int2>(downcast<const ocl_engine>(engine),
+        return std::make_unique<fully_connected_ternocl_int2>(engine,
                                                               own,
                                                               N,
                                                               K,
@@ -727,5 +722,3 @@ in_out_fmts_t TernoclInt2FCImplementationManager::query_formats(const program_no
 
 }  // namespace ocl
 }  // namespace cldnn
-
-#endif  // OV_GPU_WITH_OCL_RT
