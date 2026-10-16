@@ -624,10 +624,17 @@ public:
             // bytes, still need the original, so those cases get a separate buffer.
             const bool in_place = prog.get_config().get_cache_dir().empty() && arg.weights().get_users().size() == 1;
             // Blocking copies: mapping a large device constant can expose it before it is resident.
+            // Impls are created in parallel on one program stream; a Level Zero immediate command list is not
+            // thread-safe, so every transfer below holds the transfer lock.
+            static std::mutex transfer_mutex;
             std::vector<uint8_t> wei_host(wei_mem->size());
-            wei_mem->copy_to(stream, wei_host.data(), true);
+            {
+                std::lock_guard<std::mutex> lock(transfer_mutex);
+                wei_mem->copy_to(stream, wei_host.data(), true);
+            }
             std::vector<uint32_t> packed((K / kTernoclPackFactor) * N);
             pack_weights(wei_host.data(), packed.data(), N, K, zp);
+            std::unique_lock<std::mutex> transfer_lock(transfer_mutex);
             if (in_place) {
                 wei_mem->copy_from(stream, packed.data(), 0, 0, packed_bytes, true);
                 own.weights_id = arg.weights().id();
@@ -667,6 +674,7 @@ public:
                     engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(K)}, data_types::i8, format::bfyx}, allocation_type::usm_device, false);
                 own.had_signs->copy_from(stream, desc->hadamard_signs.data(), true);
             }
+            transfer_lock.unlock();
             std::lock_guard<std::mutex> lock(ternocl_packed_mutex());
             if (in_place)
                 ternocl_packed_buffers().emplace(buffer_key.str(), own);
