@@ -507,13 +507,13 @@ protected:
         memory::cptr in = instance.input_memory_ptr(0);
         std::vector<event::ptr> deps = events;
         if (_had_block != 0) {
-            // Rotated-basis checkpoint: the GEMM consumes H_1024(s * x) / 32.
+            // Rotated-basis checkpoint: the GEMM consumes H_B(s * x) / sqrt(B).
             const auto& rotated = instance.get_intermediates_memories().at(0);
             if (!_fwht)
-                _fwht = make_kernel(*_engine, get_program(*_engine, kTernoclFwhtSource, "-cl-std=CL3.0"), "hadamard_fwht_1024");
+                _fwht = make_kernel(*_engine, get_program(*_engine, kTernoclFwhtSource, "-cl-std=CL3.0 -DHB=" + std::to_string(_had_block)), "hadamard_fwht");
             kernel_arguments_desc d;
-            d.workGroups.global = {M * (_K / 1024) * 128, 1, 1};
-            d.workGroups.local = {128, 1, 1};
+            d.workGroups.global = {M * (_K / _had_block) * (_had_block / 8), 1, 1};
+            d.workGroups.local = {_had_block / 8, 1, 1};
             d.arguments = {{argument_desc::Types::INPUT, 0},
                            {argument_desc::Types::INPUT, 1},
                            {argument_desc::Types::OUTPUT, 0},

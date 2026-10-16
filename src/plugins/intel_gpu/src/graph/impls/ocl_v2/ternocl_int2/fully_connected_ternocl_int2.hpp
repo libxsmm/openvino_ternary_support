@@ -144,8 +144,9 @@ struct TernoclInt2FCImplementationManager : public ImplementationManager {
         // One lane per output column in 16-wide sub-group blocks; the tail is clipped, not padded.
         if (N % 16 != 0)
             TERNOCL_REJECT("N is not a multiple of 16");
-        if (fc_prim->hadamard_block != 0 && (fc_prim->hadamard_block != 1024 || K % 1024 != 0))
-            TERNOCL_REJECT("hadamard block must be 1024 and divide K");
+        if (fc_prim->hadamard_block != 0 &&
+            (!fully_connected::is_supported_hadamard_block(fc_prim->hadamard_block) || K % static_cast<int64_t>(fc_prim->hadamard_block) != 0))
+            TERNOCL_REJECT("unsupported hadamard block " + std::to_string(fc_prim->hadamard_block) + " for K=" + std::to_string(K));
 
         GPU_DEBUG_TRACE_DETAIL << "[ternocl-int2] accept " << fc_node.id() << std::endl;
         return true;
