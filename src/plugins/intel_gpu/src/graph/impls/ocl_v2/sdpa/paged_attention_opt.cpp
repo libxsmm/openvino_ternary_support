@@ -1327,10 +1327,13 @@ class PagedAttentionOptImpl : public SDPAImplBase {
 public:
     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::PagedAttentionOptImpl)
 
-    // Dispatch (e.g. PREFILL vs MIXED stage) is decided by reading past_lens/subsequence_begins contents
+    // Dispatch (e.g. PREFILL vs MIXED stage) is decided by reading past_lens/subsequence_begins contents,
+    // except for a static decode-only PA with a constant max_context_len, where it is fixed at build time.
     bool supports_replay() const override {
-        return false;
+        return m_static_decode;
     }
+
+    bool m_static_decode = false;
 
     Stage::Ptr kv_cache_update = make_stage<KVCacheUpdateGenerator>();
     Stage::Ptr pa_single_token = make_stage<PagedAttentionGeneratorSingleToken>();
@@ -1353,6 +1356,12 @@ public:
         const bool has_scores_output = desc->has_scores_output();
         const bool has_rotated_blocks = desc->has_rotated_blocks;
         const bool has_adaptive_rkv = desc->has_adaptive_rkv;
+
+        // Static params carry only constant memory deps, so MAX_CONTEXT_LEN present means it is a constant.
+        m_static_decode = !params.is_dynamic() && get_paged_attention_stage(params) == PagedAttentionStage::GENERATE &&
+                          params.memory_deps.count(PagedAttentionInputIdx::MAX_CONTEXT_LEN) > 0 && !has_scores_output && !has_rotated_blocks &&
+                          !has_adaptive_rkv && !desc->has_score_aggregation;
+        GPU_DEBUG_TRACE_DETAIL << "[record_replay] PA static decode = " << m_static_decode << std::endl;
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
         const bool use_micro_sdpa = supports_micro_sdpa(params);
@@ -2037,7 +2046,9 @@ public:
     }
 
     [[nodiscard]] std::unique_ptr<primitive_impl> clone() const override {
-        return make_deep_copy<PagedAttentionOptImpl>(this);
+        auto copy = make_deep_copy<PagedAttentionOptImpl>(this);
+        copy->m_static_decode = m_static_decode;
+        return copy;
     }
 };
 
