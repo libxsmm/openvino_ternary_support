@@ -1647,11 +1647,12 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         pass_config->disable<ov::pass::RoPEFusionIOSlicing>();
         pass_config->disable<ov::pass::RoPEShareCosSin>();
 
+        manager.register_pass<ov::intel_gpu::IncreasePositionIdsPrecision>();
+        // After IncreasePositionIdsPrecision: its RoPE matchers expect the 3-input RoPE, and a rotary path they
+        // skip can be rewritten by a matcher that converts only one of two MatMuls sharing the position ids.
         if (config.get_enable_rms_rope_fusion()) {
             manager.register_pass<ov::intel_gpu::FuseRMSRoPE>();
         }
-
-        manager.register_pass<ov::intel_gpu::IncreasePositionIdsPrecision>();
         manager.register_pass<ov::intel_gpu::FuseAtan2Decomposed>();
         if (device_info.supports_immad && config.get_use_onednn() && !disable_gated_mlp_fusion) {
             manager.register_pass<ov::intel_gpu::FuseGatedMLP>();
