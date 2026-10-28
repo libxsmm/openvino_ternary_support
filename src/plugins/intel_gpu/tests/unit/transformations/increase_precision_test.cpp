@@ -786,9 +786,10 @@ namespace {
 // takes the i32 Convert output of `position_ids` and returns the node whose output feeds the
 // f16/f32 Convert on the MatMul path, letting each test inject model-specific pre-Convert ops
 // (e.g. Reshape/StridedSlice). When `is_ref` is true, the returned model carries the f16<->f32
-// Convert nodes that IncreasePositionIdsPrecision is expected to insert.
+// Convert nodes that IncreasePositionIdsPrecision is expected to insert. `const_freq` replaces the
+// inv_freq Broadcast with a constant, as left by constant folding.
 template <typename InsertPreConvert>
-std::shared_ptr<ov::Model> build_qwen3vl_rope_model(InsertPreConvert&& insert_pre_convert, bool is_ref) {
+std::shared_ptr<ov::Model> build_qwen3vl_rope_model(InsertPreConvert&& insert_pre_convert, bool is_ref, bool const_freq = false) {
     auto position_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{3, -1});
     auto input_convert = std::make_shared<ov::op::v0::Convert>(position_ids, ov::element::i32);
     auto input_reshape = insert_pre_convert(input_convert);
@@ -808,8 +809,11 @@ std::shared_ptr<ov::Model> build_qwen3vl_rope_model(InsertPreConvert&& insert_pr
         std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{1, 1, 64, 1}), concat);
 
     std::shared_ptr<ov::Node> matmul_lhs = broadcast;
+    if (const_freq) {
+        matmul_lhs = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{3, 1, 64, 1}, {0.5f});
+    }
     if (is_ref) {
-        matmul_lhs = std::make_shared<ov::op::v0::Convert>(broadcast, ov::element::f32);
+        matmul_lhs = std::make_shared<ov::op::v0::Convert>(matmul_lhs, ov::element::f32);
     }
     auto matmul = std::make_shared<ov::op::v0::MatMul>(matmul_lhs, convert_2);
 
@@ -873,6 +877,25 @@ TEST_F(TransformationTestsF, IncreasePositionIdsPrecisionForQwen35) {
     model = build_qwen3vl_rope_model(insert_pre_convert, /*is_ref=*/false);
     manager.register_pass<IncreasePositionIdsPrecision>();
     model_ref = build_qwen3vl_rope_model(insert_pre_convert, /*is_ref=*/true);
+    comparator.enable(FunctionsComparator::CmpValues::ATTRIBUTES);
+}
+
+TEST_F(TransformationTestsF, IncreasePositionIdsPrecisionForQwen35Mtp) {
+    // Qwen3.5 MTP draft: position_ids are broadcast to the 3 M-RoPE sections inside the model
+    // (Unsqueeze -> Broadcast) and the inv_freq Broadcast is constant-folded.
+    auto insert_pre_convert = [](const std::shared_ptr<ov::Node>& input_convert) -> std::shared_ptr<ov::Node> {
+        auto unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(input_convert,
+                ov::op::v0::Constant::create(ov::element::i32, ov::Shape{1}, {0}));
+        auto target_shape = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{
+                ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {3}),
+                std::make_shared<ov::op::v3::ShapeOf>(input_convert, ov::element::i64)}, 0);
+        auto broadcast = std::make_shared<ov::op::v3::Broadcast>(unsqueeze, target_shape);
+        return std::make_shared<ov::op::v1::Reshape>(broadcast,
+                ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {3, -1, 1, 1}), true);
+    };
+    model = build_qwen3vl_rope_model(insert_pre_convert, /*is_ref=*/false, /*const_freq=*/true);
+    manager.register_pass<IncreasePositionIdsPrecision>();
+    model_ref = build_qwen3vl_rope_model(insert_pre_convert, /*is_ref=*/true, /*const_freq=*/true);
     comparator.enable(FunctionsComparator::CmpValues::ATTRIBUTES);
 }
 

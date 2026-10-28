@@ -218,14 +218,17 @@ IncreasePositionIdsPrecisionForQwen3VL::IncreasePositionIdsPrecisionForQwen3VL()
     // Key difference from Qwen2.5-VL: Unsqueeze is decomposed to Reshape.
     auto position_ids = any_input();
     auto convert_to_i32 = wrap_type<ov::op::v0::Convert>({position_ids});
-    auto reshape_0 = optional<ov::op::v1::Reshape>({convert_to_i32, wrap_const()});
+    // The Qwen3.5 MTP draft broadcasts 2D position_ids to the 3 M-RoPE sections (Unsqueeze -> Broadcast)
+    // and its inv_freq Broadcast is constant-folded.
+    auto reshape_0 = optional<ov::op::v1::Reshape, ov::op::v0::Unsqueeze>({convert_to_i32, wrap_const()});
     auto stridedslice_0 = optional<ov::op::v1::StridedSlice>({reshape_0, any_input(), any_input(), any_input()});
-    auto reshape_unsqueeze = wrap_type<ov::op::v1::Reshape>({stridedslice_0, wrap_const()});
-    auto unsqueeze = wrap_type<ov::op::v0::Unsqueeze>({stridedslice_0, any_input()});
+    auto broadcast_0 = optional<ov::op::v3::Broadcast>({stridedslice_0, any_input()});
+    auto reshape_unsqueeze = wrap_type<ov::op::v1::Reshape>({broadcast_0, wrap_const()});
+    auto unsqueeze = wrap_type<ov::op::v0::Unsqueeze>({broadcast_0, any_input()});
     auto reshape_or_unsqueeze = std::make_shared<Or>(OutputVector{reshape_unsqueeze, unsqueeze});
     auto convert_to_f16 = wrap_type<ov::op::v0::Convert>({reshape_or_unsqueeze});
 
-    auto broadcast_freq = wrap_type<ov::op::v3::Broadcast>({any_input(), any_input()});
+    auto broadcast_freq = std::make_shared<Or>(OutputVector{wrap_type<ov::op::v3::Broadcast>({any_input(), any_input()}), wrap_const()});
     auto matmul = wrap_type<ov::op::v0::MatMul>({broadcast_freq, convert_to_f16});
 
     auto reshape = wrap_type<ov::op::v1::Reshape>({matmul, any_input()});
