@@ -78,9 +78,13 @@ struct ternocl_int2_weights_reorder : public typed_primitive_impl<reorder> {
 
         const auto& in_layout = instance.get_impl_params()->get_input_layout(0);
         const auto& shape = in_layout.get_shape();
-        const size_t N = shape[0];
-        const size_t K = shape[1];
-        OPENVINO_ASSERT(ov::shape_size(shape) == N * K && K % kTernoclPackFactor == 0,
+        // FC weights are [N, K] (canonicalized to 4D), MoE experts [E, N, K] or [E, N, K/128, 128].
+        const bool experts = instance.get_impl_params()->get_output_layout().format == format::b_y_xs_f_xsv16_ternary;
+        OPENVINO_ASSERT(shape.size() >= (experts ? 3u : 2u), "[GPU] ternocl int2: unexpected weights rank for ", instance.id());
+        const size_t E = experts ? shape[0] : 1;
+        const size_t N = experts ? shape[1] : shape[0];
+        const size_t K = experts ? ov::shape_size(shape) / (E * N) : shape[1];
+        OPENVINO_ASSERT(ov::shape_size(shape) == E * N * K && K % kTernoclPackFactor == 0,
                         "[GPU] ternocl int2: unexpected weights shape ",
                         in_layout.to_short_string(),
                         " for ",
@@ -88,15 +92,21 @@ struct ternocl_int2_weights_reorder : public typed_primitive_impl<reorder> {
 
         cldnn::mem_lock<uint8_t, mem_lock_type::read> src(instance.input_memory_ptr(), stream);
         cldnn::mem_lock<uint32_t, mem_lock_type::write> dst(instance.output_memory_ptr(), stream);
-        OPENVINO_ASSERT(src.size() >= N * K / 4 && dst.size() * sizeof(uint32_t) >= N * K / 4,
-                        "[GPU] ternocl int2: weight buffers are smaller than ",
-                        N * K / 4,
+        const size_t bytes = E * N * K / 4;
+        // The packed layout holds exactly the codes: a larger one would mean padding the kernels do not expect.
+        OPENVINO_ASSERT(src.size() >= bytes && dst.size() * sizeof(uint32_t) == bytes,
+                        "[GPU] ternocl int2: packed weights take ",
+                        dst.size() * sizeof(uint32_t),
+                        " B instead of ",
+                        bytes,
                         " B for ",
                         instance.id());
-        OPENVINO_ASSERT(pack_weights(src.data(), dst.data(), N, K),
-                        "[GPU] ternocl int2: ",
-                        instance.id(),
-                        " has a weight code outside the ternary range {-1, 0, +1}");
+        for (size_t e = 0; e < E; ++e) {
+            OPENVINO_ASSERT(pack_weights(src.data() + e * N * K / 4, dst.data() + e * N * (K / kTernoclPackFactor), N, K),
+                            "[GPU] ternocl int2: ",
+                            instance.id(),
+                            " has a weight code outside the ternary range {-1, 0, +1}");
+        }
 
         return cpu::make_output_event(stream, instance.is_output());
     }
@@ -119,7 +129,8 @@ std::unique_ptr<primitive_impl> TernoclInt2WeightsReorderImplementationManager::
 }
 
 std::unique_ptr<primitive_impl> TernoclInt2WeightsReorderImplementationManager::create_impl(const kernel_impl_params& params) const {
-    if (params.get_output_layout().format != format::is_os_yx_isv16_ternary)
+    const auto out_format = params.get_output_layout().format;
+    if (out_format != format::is_os_yx_isv16_ternary && out_format != format::b_y_xs_f_xsv16_ternary)
         return stock_reorder_manager(*this, get_shape_type(params)).create_impl(params);
     return std::make_unique<ternocl_int2_weights_reorder>("ternocl_int2_weights_reorder");
 }

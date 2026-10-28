@@ -268,6 +268,12 @@ static typename std::enable_if<std::is_integral<T>::value, T>::type align_to(T s
     return static_cast<T>((size % align == 0) ? size : size - size % align + align);
 }
 
+// The TernOCL int2 impls (FullyConnected and MoE experts) are the ones that run ternary (u2) weights.
+static bool ternocl_int2_path(const ov::intel_gpu::ExecutionConfig& config, const cldnn::device_info& device_info, cldnn::runtime_types runtime) {
+    return (runtime == cldnn::runtime_types::ocl || runtime == cldnn::runtime_types::ze) && config.get_enable_ternocl_int2() &&
+           device_info.arch >= cldnn::gpu_arch::xe2 && device_info.supports_immad;
+}
+
 static bool is_decompression_multiply(const std::shared_ptr<const ov::Node> node, bool supports_immad) {
     std::vector<ov::DiscreteTypeInfo> target_consumers = {ov::opset1::MatMul::get_type_info_static(),
                                                           ov::op::internal::MOE::get_type_info_static(),
@@ -700,10 +706,10 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         // Also gated on inference precision: GatherMatmul and fused MoE kernels support only f16 activations.
         const bool f16_activations_possible = infer_precision == ov::element::f16 || infer_precision == ov::element::dynamic;
         if (device_info.supports_immad && config.get_use_onednn() && f16_activations_possible) {
-            const std::vector<ov::element::Type> supported_compressed_weights_types{ov::element::u4,
-                                                                                    ov::element::i4,
-                                                                                    ov::element::i8,
-                                                                                    ov::element::u8};
+            std::vector<ov::element::Type> supported_compressed_weights_types{ov::element::u4, ov::element::i4, ov::element::i8, ov::element::u8};
+            // Ternary experts run on the TernOCL MoE impl, the only one that accepts u2.
+            if (ternocl_int2_path(config, device_info, m_context->get_engine().runtime_type()))
+                supported_compressed_weights_types.push_back(ov::element::u2);
             manager.register_pass<ov::pass::ConvertGroupedMatMulToGroupedMatMulCompressed>(
                 supported_compressed_weights_types);
 
@@ -1764,9 +1770,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         // Ternary (u2) checkpoints on the TernOCL path run faster with gate/up merged into
         // one FC followed by the SwiGLU primitive.
-        const auto runtime = m_context->get_engine().runtime_type();
-        const bool ternocl_int2 = (runtime == cldnn::runtime_types::ocl || runtime == cldnn::runtime_types::ze) && config.get_enable_ternocl_int2() &&
-                                  device_info.arch >= cldnn::gpu_arch::xe2 && device_info.supports_immad;
+        const bool ternocl_int2 = ternocl_int2_path(config, device_info, m_context->get_engine().runtime_type());
         bool has_u2_weights = false;
         for (const auto& op : func->get_ops()) {
             const auto c = ov::as_type_ptr<ov::op::v0::Constant>(op);

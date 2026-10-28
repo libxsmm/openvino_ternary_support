@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <optional>
 
 #include "ov_ops/moe_compressed.hpp"
 #include "intel_gpu/plugin/program_builder.hpp"
@@ -113,6 +114,29 @@ static bool prepare_moe_otd_params(ProgramBuilder& p,
     return otd_enabled;
 }
 
+// u2 experts: the value shared by every zero point of the three routed projections, if they are
+// constants holding a single value (the TernOCL MoE impl requires 1, i.e. ternary codes).
+static std::optional<float> ternary_zero_point_scalar(const std::shared_ptr<ov::op::internal::MOECompressed>& op) {
+    using input_idx = cldnn::moe_3gemm_fused_compressed::input_index;
+    if (!op->get_config().has_zp || op->get_input_element_type(static_cast<size_t>(input_idx::weight_0)) != ov::element::u2)
+        return std::nullopt;
+    std::optional<float> value;
+    for (const auto idx : {input_idx::zp_0, input_idx::zp_1, input_idx::zp_2}) {
+        const auto zp = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(static_cast<size_t>(idx)));
+        if (!zp)
+            return std::nullopt;
+        const auto values = zp->cast_vector<float>();
+        if (values.empty())
+            return std::nullopt;
+        for (const auto v : values) {
+            if (v != values.front() || (value.has_value() && v != *value))
+                return std::nullopt;
+        }
+        value = values.front();
+    }
+    return value;
+}
+
 static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::op::internal::MOECompressed>& op) {
     auto inputs = p.GetInputInfo(op);
     const auto& config = op->get_config();
@@ -133,7 +157,8 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
         prepare_moe_otd_params(p, op, weight_bin_offsets, weights_path, lru_expert_num);
 
         const std::string layerName = layer_type_name_ID(op);
-        const cldnn::moe_3gemm_fused_compressed moe(layerName, input_infos, config, weight_bin_offsets, weights_path, lru_expert_num);
+        cldnn::moe_3gemm_fused_compressed moe(layerName, input_infos, config, weight_bin_offsets, weights_path, lru_expert_num);
+        moe.decompression_zero_point_scalar = ternary_zero_point_scalar(op);
         p.add_primitive(*op, moe);
     } else {
         // Create GEMM2_BIAS_SWIGLU_CLAMP specific primitives

@@ -14,10 +14,13 @@
 #include <intel_gpu/runtime/memory.hpp>
 #include <iostream>
 #include <numeric>
+#include <optional>
+#include <random>
 
 #include "../../common/random_generator.hpp"
 #include "../test_utils/test_utils.h"
 #include "moe_3gemm_test_data.h"
+#include "primitive_inst.h"
 
 using namespace cldnn;
 using namespace ::tests;
@@ -1619,4 +1622,236 @@ TEST(moe_3gemm_expert_mask, shape_predictor_overflow_regression) {
     for (int e = 0; e < num_experts; e++)
         total += static_cast<int>(result.batch[e].size());
     ASSERT_EQ(total, actual_tokens * top_k);
+}
+
+// TernOCL ternary MoE experts (moe_3gemm_ternocl_int2): u2 codes {0, 1, 2} with zero point 1, i.e.
+// weights {-1, 0, +1}, and one f16 scale per 128-group. The routing (top-k weights and expert indices)
+// is given as inputs, so the reference sees exactly the experts the kernels use.
+namespace {
+
+bool ternocl_int2_moe_supported(engine& engine) {
+    const auto& info = engine.get_device_info();
+    const auto runtime = engine.runtime_type();
+    return (runtime == runtime_types::ocl || runtime == runtime_types::ze) && info.arch >= gpu_arch::xe2 && info.supports_immad;
+}
+
+struct ternary_moe_params {
+    int64_t hidden, inter, experts, top_k;
+    bool int8_prefill;
+    bool weights_3d;  // [E, N, K] as the MoE fusion leaves them, else [E, N, K/128, 128]
+};
+
+struct ternary_projection {
+    int64_t n, k;
+    std::vector<int8_t> w;           // [E, n, k]
+    std::vector<ov::float16> scale;  // [E, n, k / 128]
+    std::vector<uint8_t> packed;
+    memory::ptr weights, scales, zp;
+};
+
+ternary_projection make_ternary_projection(engine& engine, tests::random_generator& rg, int64_t experts, int64_t n, int64_t k, bool weights_3d) {
+    ternary_projection p{n, k};
+    const int64_t groups = k / 128;
+    // About 40% zeros, as in the ternary checkpoints.
+    auto u = rg.generate_random_1d<float>(experts * n * k, 0.0f, 1.0f, 100);
+    p.w.resize(experts * n * k);
+    p.packed.assign(experts * n * k / 4, 0);
+    for (int64_t i = 0; i < experts * n * k; ++i) {
+        p.w[i] = u[i] < 0.4f ? 0 : (u[i] < 0.7f ? 1 : -1);
+        p.packed[i / 4] |= static_cast<uint8_t>((p.w[i] + 1) << (2 * (i % 4)));
+    }
+    p.scale = rg.generate_random_1d<ov::float16>(experts * n * groups, 0.01f, 0.1f, 1000);
+    p.weights =
+        engine.allocate_memory({weights_3d ? ov::PartialShape{experts, n, k} : ov::PartialShape{experts, n, groups, 128}, data_types::u2, format::bfyx});
+    p.scales = engine.allocate_memory({ov::PartialShape{experts, n, groups, 1}, data_types::f16, format::bfyx});
+    p.zp = engine.allocate_memory({ov::PartialShape{experts, 1, 1, 1}, data_types::f16, format::bfyx});
+    set_values(p.weights, p.packed);
+    set_values(p.scales, p.scale);
+    set_values(p.zp, std::vector<ov::float16>(experts, ov::float16(1.0f)));
+    return p;
+}
+
+// x [k] . expert e of p, column n
+float ternary_dot(const ternary_projection& p, int64_t e, int64_t n, const float* x) {
+    const int64_t groups = p.k / 128;
+    const int8_t* w = p.w.data() + (e * p.n + n) * p.k;
+    float acc = 0.0f;
+    for (int64_t g = 0; g < groups; ++g) {
+        float part = 0.0f;
+        for (int64_t kk = g * 128; kk < (g + 1) * 128; ++kk)
+            part += x[kk] * w[kk];
+        acc += part * static_cast<float>(p.scale[(e * p.n + n) * groups + g]);
+    }
+    return acc;
+}
+
+// Runs the MoE for each token count of ts on one network (dynamic: one impl for all) and checks it
+// against a host reference. With is_caching_test the network is exported and imported before it runs.
+void run_ternary_moe(const ternary_moe_params& p,
+                     bool dynamic,
+                     const std::vector<int64_t>& ts,
+                     bool is_caching_test = false,
+                     std::optional<float> zero_point = 1.0f) {
+    auto& engine = get_test_engine();
+    tests::random_generator rg(GET_SUITE_NAME);
+    const int64_t E = p.experts, H = p.hidden, I = p.inter, K = p.top_k;
+    auto gate = make_ternary_projection(engine, rg, E, I, H, p.weights_3d);
+    auto up = make_ternary_projection(engine, rg, E, I, H, p.weights_3d);
+    auto down = make_ternary_projection(engine, rg, E, H, I, p.weights_3d);
+
+    const int64_t max_t = *std::max_element(ts.begin(), ts.end());
+    const int64_t t_dim = dynamic ? -1 : max_t;
+    topology topology(input_layout("hidden_states", layout{ov::PartialShape{1, t_dim, H}, data_types::f16, format::bfyx}),
+                      input_layout("topk_weights", layout{ov::PartialShape{t_dim, K}, data_types::f16, format::bfyx}),
+                      input_layout("topk_indices", layout{ov::PartialShape{t_dim, K}, data_types::i32, format::bfyx}));
+    std::vector<input_info> inputs{input_info("hidden_states"), input_info("topk_weights"), input_info("topk_indices")};
+    for (auto* proj : {&gate, &up, &down}) {
+        const std::string id = proj == &gate ? "w0" : (proj == &up ? "w1" : "w2");
+        topology.add(data(id + "_weight", proj->weights), data(id + "_scale", proj->scales), data(id + "_zp", proj->zp));
+        inputs.insert(inputs.end(), {input_info(id + "_weight"), input_info(id + "_scale"), input_info(id + "_zp")});
+    }
+    cldnn::MOECompressed::Config config;
+    config.expert_type = ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU;
+    config.hidden_size = H;
+    config.inter_size = I;
+    config.num_expert = E;
+    config.top_k = K;
+    config.group_size = 128;
+    config.out_type = data_types::f16;
+    config.has_zp = true;
+    auto moe = moe_3gemm_fused_compressed("moe", inputs, config);
+    moe.decompression_zero_point_scalar = zero_point;
+    topology.add(moe);
+
+    auto net_config = get_test_default_config(engine);
+    net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    net_config.set_property(ov::intel_gpu::optimize_data(true));
+    net_config.set_property(ov::intel_gpu::ternocl_int2_int8_prefill(p.int8_prefill));
+    if (zero_point != 1.0f) {
+        // No other MoE impl takes u2 experts.
+        ASSERT_ANY_THROW(get_network(engine, topology, net_config, get_test_stream_ptr(), is_caching_test));
+        return;
+    }
+    network::ptr net = get_network(engine, topology, net_config, get_test_stream_ptr(), is_caching_test);
+
+    // The experts are packed into constants of their own; the u2 sources are left untouched.
+    for (auto* proj : {&gate, &up, &down}) {
+        cldnn::mem_lock<uint8_t, mem_lock_type::read> src(proj->weights, get_test_stream());
+        ASSERT_TRUE(std::equal(proj->packed.begin(), proj->packed.end(), src.begin()));
+    }
+
+    for (const int64_t T : ts) {
+        auto x = rg.generate_random_1d<ov::float16>(T * H, -1.0f, 1.0f, 100);
+        std::vector<int32_t> ids(T * K);
+        std::vector<ov::float16> rw(T * K);
+        std::vector<int32_t> experts(E);
+        std::iota(experts.begin(), experts.end(), 0);
+        for (int64_t t = 0; t < T; ++t) {
+            // distinct experts per token, routing weights summing to 1
+            std::shuffle(experts.begin(), experts.end(), std::mt19937(static_cast<uint32_t>(T * 1000 + t)));
+            auto w = rg.generate_random_1d<float>(K, 0.1f, 1.0f, 100);
+            const float sum = std::accumulate(w.begin(), w.end(), 0.0f);
+            for (int64_t j = 0; j < K; ++j) {
+                ids[t * K + j] = experts[j];
+                rw[t * K + j] = ov::float16(w[j] / sum);
+            }
+        }
+        auto x_mem = engine.allocate_memory({ov::PartialShape{1, T, H}, data_types::f16, format::bfyx});
+        auto rw_mem = engine.allocate_memory({ov::PartialShape{T, K}, data_types::f16, format::bfyx});
+        auto ids_mem = engine.allocate_memory({ov::PartialShape{T, K}, data_types::i32, format::bfyx});
+        set_values(x_mem, x);
+        set_values(rw_mem, rw);
+        set_values(ids_mem, ids);
+        net->set_input_data("hidden_states", x_mem);
+        net->set_input_data("topk_weights", rw_mem);
+        net->set_input_data("topk_indices", ids_mem);
+        auto outputs = net->execute();
+        ASSERT_EQ(net->get_primitive("moe")->get_impl()->get_kernel_name(), "ternocl_int2_moe");
+
+        std::vector<float> ref(T * H, 0.0f);
+        std::vector<float> xf(H), h(I);
+        float max_abs = 0.0f;
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t i = 0; i < H; ++i)
+                xf[i] = static_cast<float>(x[t * H + i]);
+            for (int64_t j = 0; j < K; ++j) {
+                const int64_t e = ids[t * K + j];
+                for (int64_t n = 0; n < I; ++n) {
+                    const float g = ternary_dot(gate, e, n, xf.data());
+                    h[n] = static_cast<float>(ov::float16(g / (1.0f + std::exp(-g)) * ternary_dot(up, e, n, xf.data())));
+                }
+                for (int64_t n = 0; n < H; ++n)
+                    ref[t * H + n] += static_cast<float>(rw[t * K + j]) * ternary_dot(down, e, n, h.data());
+            }
+            for (int64_t n = 0; n < H; ++n)
+                max_abs = std::max(max_abs, std::fabs(ref[t * H + n]));
+        }
+
+        // int8 prefill quantizes the activations per 128-group (~1/127 relative per element).
+        const float tol = (p.int8_prefill && T >= 16 ? 0.03f : 0.01f) * std::max(max_abs, 1.0f);
+        ASSERT_EQ(outputs.at("moe").get_layout().count(), ref.size());
+        cldnn::mem_lock<ov::float16, mem_lock_type::read> out(outputs.at("moe").get_memory(), get_test_stream());
+        for (size_t i = 0; i < ref.size(); ++i)
+            ASSERT_NEAR(ref[i], static_cast<float>(out[i]), tol) << "T=" << T << " index " << i;
+    }
+}
+
+}  // namespace
+
+// Decode GEMVs below 16 tokens, then the three prefill tile bands (<= 64, <= 512, larger).
+// The static and one cached case keep the experts 4D, as the op specifies them.
+TEST(moe_3gemm_ternocl_int2, dynamic_decode_and_prefill_bands) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, false, true}, true, {1, 3, 15, 16, 40, 100, 600});
+}
+
+TEST(moe_3gemm_ternocl_int2, dynamic_int8_prefill) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, true, true}, true, {2, 20, 100});
+}
+
+// 128 experts and top-8, as Qwen3-30B-A3B, with one 128-group per down-projection row.
+TEST(moe_3gemm_ternocl_int2, many_experts_one_group) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 128, 128, 8, false, true}, true, {1, 70});
+}
+
+// The expert shapes of Qwen3-30B-A3B: hidden 2048, intermediate 768, 128 experts, top-8.
+TEST(moe_3gemm_ternocl_int2, qwen3_30b_a3b_shapes) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({2048, 768, 128, 8, false, true}, true, {1, 4, 32});
+}
+
+TEST(moe_3gemm_ternocl_int2, static_decode) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, false, false}, false, {5});
+}
+
+TEST(moe_3gemm_ternocl_int2, static_prefill) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, false, false}, false, {33});
+}
+
+TEST(moe_3gemm_ternocl_int2, cached_dynamic) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, false, true}, true, {1, 20}, true);
+}
+
+TEST(moe_3gemm_ternocl_int2, cached_dynamic_int8_prefill) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, true, false}, true, {1, 20}, true);
+}
+
+TEST(moe_3gemm_ternocl_int2, non_ternary_zero_point_is_rejected) {
+    if (!ternocl_int2_moe_supported(get_test_engine()))
+        GTEST_SKIP();
+    run_ternary_moe({256, 384, 8, 2, false, true}, true, {1}, false, 2.0f);
 }

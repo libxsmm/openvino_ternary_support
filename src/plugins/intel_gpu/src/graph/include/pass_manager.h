@@ -210,6 +210,7 @@ private:
     weights_bias_offset get_weights_bias_offset(const T& node);
     template <typename T>
     void optimize_weights(T& node, program& p);
+    void optimize_moe_weights(program_node& node, program& p);
     void select_implementation(program& p, program_node& node);
     void add_lstm_weights_reorder(primitive_id input_id,
                                   std::shared_ptr<WeightsReorderParams> reorder_params,

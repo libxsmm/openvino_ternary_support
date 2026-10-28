@@ -11,6 +11,7 @@
 #include "fully_connected_inst.h"
 #include "lstm_seq_inst.h"
 #include "gru_seq_inst.h"
+#include "moe_3gemm_fused_inst.h"
 #include "intel_gpu/runtime/format.hpp"
 #include "permute_inst.h"
 #include "crop_inst.h"
@@ -169,6 +170,41 @@ void post_optimize_weights::optimize_weights(T& node, program& p) {
         }
     }
     // set the old output layout and do not invalidate users as change of weights will not affect output layout
+    node.set_output_layout(output_layout, false);
+}
+
+// MoE: the selected impl's weights reorder params give the format and rank of the routed expert
+// weights (the trailing dims of a higher-rank source are merged into the last one); gate, up and down
+// each get a reorder, folded with the constants later.
+void post_optimize_weights::optimize_moe_weights(program_node& node, program& p) {
+    auto impl = node.get_selected_impl();
+    if (!impl || !impl->get_weights_reorder_params())
+        return;
+    const auto& target = impl->get_weights_reorder_params()->get_output_layout();
+    const auto weights_format = target.format;
+    const size_t rank = target.get_partial_shape().size();
+    auto output_layout = node.get_output_layout();
+    using idx = moe_3gemm_fused_compressed::input_index;
+    for (const auto i : {idx::weight_0, idx::weight_1, idx::weight_2}) {
+        const auto dep = static_cast<size_t>(i);
+        program_node& prev_node = node.get_dependency(dep);
+        auto in_layout = prev_node.get_output_layout(false);
+        if (in_layout.format == weights_format)
+            continue;
+        auto shape = in_layout.get_shape();
+        OPENVINO_ASSERT(rank > 0 && shape.size() >= rank, "[GPU] MoE weights ", prev_node.id(), " have a lower rank than the impl's packed layout");
+        ov::Shape out_shape(shape.begin(), shape.begin() + rank);
+        for (size_t d = rank; d < shape.size(); ++d)
+            out_shape[rank - 1] *= shape[d];
+        layout out_layout{ov::PartialShape(out_shape), in_layout.data_type, weights_format};
+        auto weights_reorder = _rf.get_weights_reorder(prev_node.id(), std::make_shared<WeightsReorderParams>(in_layout, out_layout));
+        p.add_intermediate(weights_reorder.first, node, dep, !weights_reorder.second);
+        auto& weights_reorder_node = node.get_dependency(dep);
+        weights_reorder_node.get_output_layout(false);
+        // A constant source is packed by propagate_constants, which selects the reorder impl itself.
+        if (!weights_reorder.second && !weights_reorder_node.is_constant())
+            select_implementation(p, weights_reorder_node);
+    }
     node.set_output_layout(output_layout, false);
 }
 
@@ -336,6 +372,8 @@ void post_optimize_weights::run(program& p) {
             found_lstm = true;
         } else if (node->is_type<gru_seq>()) {
             optimize_weights(node->as<gru_seq>(), p);
+        } else if (node->is_type<moe_3gemm_fused_compressed>()) {
+            optimize_moe_weights(*node, p);
         }
     }
     if (found_lstm) {

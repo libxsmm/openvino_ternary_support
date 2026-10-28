@@ -4,6 +4,7 @@
 
 #pragma once
 #include <filesystem>
+#include <optional>
 #include <vector>
 #include <string>
 
@@ -143,6 +144,9 @@ struct moe_3gemm_fused_compressed : public primitive_base<moe_3gemm_fused_compre
 
     MOECompressed::Config _config;
     moe_otd_descriptor _otd;
+    // Set when the zero points of the three routed projections are constants with this one value
+    // (only recorded for u2 experts, where the TernOCL impl needs it to be 1).
+    std::optional<float> decompression_zero_point_scalar = std::nullopt;
 
     bool operator==(const primitive& rhs) const override {
         if (!compare_common_params(rhs)) {
@@ -151,19 +155,30 @@ struct moe_3gemm_fused_compressed : public primitive_base<moe_3gemm_fused_compre
 
         auto rhs_casted = downcast<const moe_3gemm_fused_compressed>(rhs);
 
-        return std::memcmp(&_config, &rhs_casted._config, sizeof(_config)) == 0 && _otd == rhs_casted._otd;
+        return std::memcmp(&_config, &rhs_casted._config, sizeof(_config)) == 0 && _otd == rhs_casted._otd &&
+               decompression_zero_point_scalar == rhs_casted.decompression_zero_point_scalar;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
         primitive_base<moe_3gemm_fused_compressed>::save(ob);
         ob << make_data(&_config, sizeof(_config));
         _otd.save(ob);
+        ob << decompression_zero_point_scalar.has_value();
+        if (decompression_zero_point_scalar.has_value())
+            ob << decompression_zero_point_scalar.value();
     }
 
     void load(BinaryInputBuffer& ib) override {
         primitive_base<moe_3gemm_fused_compressed>::load(ib);
         ib >> make_data(&_config, sizeof(_config));
         _otd.load(ib);
+        bool has_zp_scalar = false;
+        ib >> has_zp_scalar;
+        if (has_zp_scalar) {
+            float zp = 0.0f;
+            ib >> zp;
+            decompression_zero_point_scalar = zp;
+        }
     }
 };
 

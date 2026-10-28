@@ -324,7 +324,7 @@ wwb --target-model $WORK/bonsai2-27b-genai --gt-data gt_stock.csv \
     --model-type visual-text-only --genai --device GPU
 ```
 
-### 5.3 Other ternary checkpoints (Bonsai 1.7B-8B, CAT-Q)
+### 5.3 Other ternary checkpoints (Bonsai 1.7B-8B, CAT-Q, MoE)
 
 The same impl serves any ternary checkpoint; nothing above is specific to the
 27B except the Hadamard rotation. A Qwen3-family checkpoint is a plain LLM for
@@ -344,6 +344,22 @@ Then `llm_bench` as in 5.1, and `wwb --model-type text` against `<name>-fp16`
 (or against the stock kernels as in 5.2). Bonsai 8B on an Arc Pro B70: 168
 tokens/s; WWB similarity 0.988 between TernOCL and the stock kernels, 0.77
 between the ternary and the fp16 model (the stock kernels score the same 0.77).
+
+Mixture-of-experts checkpoints (CAT-Q Qwen3-30B-A3B) export the same way. Their
+router gates are not ternary, so let the tool keep every non-ternary weight
+dense; the expert weights are rewritten as rank-3 `u2` constants and run on the
+TernOCL MoE impl (`OV_VERBOSE=4` shows `ternocl_int2_moe` per MoE layer).
+`--dtype i4` writes the same ternary codes as 4-bit, a lossless reference on the
+stock MoE kernels:
+
+```bash
+./venv/bin/python $TOOLS/quantize_ir_ternary.py --in <name>-fp16/openvino_model.xml \
+    --out <name>-u2/openvino_model.xml --min-k 512 --only-ternary
+```
+
+CAT-Q Qwen3-30B-A3B on an Arc Pro B70 (Core Ultra 9 285K host), 128 tokens:
+187 tokens/s against 141 for the same weights as `i4` on the stock kernels,
+the same greedy output, GSM8K 28.1% against 29.0% (±1.2%).
 
 ### 5.4 Speculative decoding
 

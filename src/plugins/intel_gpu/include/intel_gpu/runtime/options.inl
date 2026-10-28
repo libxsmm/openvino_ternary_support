@@ -85,9 +85,9 @@ OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, moe_use_gpu_mask_gen_prefill, f
 OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, moe_use_grouped_gemm_prefill, true, "MoE 3GEMM: use a single OneDNN grouped matmul per GEMM layer for the prefill path. Takes priority over micro-kernel GEMM")
 OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, moe_batched_gemv_threshold, 32, "MoE 3-GEMM: token count (<=) that selects the batched GEMV decode path instead of the prefill path")
 OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, moe_disable_fusion, false, "Disable fusion of MoE subgraph to composite MoE operation")
-OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_ternocl_int2, true, "Enable/Disable the TernOCL implementation of FullyConnected with ternary (u2) weights; when disabled the stock kernels are used")
+OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_ternocl_int2, true, "Enable/Disable the TernOCL implementations of FullyConnected and MoE experts with ternary (u2) weights; when disabled the stock kernels are used")
 OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_rms_rope_fusion, true, "Enable/Disable the pass which folds per-head Q/K RMSNorm into RoPE")
-OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, ternocl_int2_int8_prefill, false, "TernOCL ternary FullyConnected: run M > 8 on the int2 x int8 DPAS GEMM, quantizing activations to int8 per 128-group")
+OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, ternocl_int2_int8_prefill, false, "TernOCL ternary FullyConnected: run M > 8 on the int2 x int8 DPAS GEMM, quantizing activations to int8 per 128-group; ternary MoE prefill likewise")
 OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, record_replay, false, "Enable level-zero command list through record and replay for static models")
 
 OV_CONFIG_DEBUG_GLOBAL_OPTION(ov::intel_gpu, help, false, "Print help message for all config options")

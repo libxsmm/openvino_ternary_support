@@ -1,4 +1,4 @@
-# TernOCL int2 FullyConnected — Architecture
+# TernOCL int2 FullyConnected and MoE experts — Architecture
 
 How 2-bit (ternary) `FullyConnected` layers are executed by the TernOCL OpenCL
 kernels inside the OpenVINO GPU plugin.
@@ -45,12 +45,14 @@ the input transform `hadamard/hadamard_fwht.cl` in front of either.
 |---|---|
 | `impls/ocl_v2/ternocl_int2/fully_connected_ternocl_int2.hpp` | Registration, acceptance rules, fused-chain -> epilogue mapping |
 | `impls/ocl_v2/ternocl_int2/fully_connected_ternocl_int2.cpp` | Weights reorder request, tile tables, one kernel stage per launch class, execution of both GEMM families |
-| `impls/ocl_v2/ternocl_int2/ternocl_int2_weights_reorder.cpp` | Weights reorder `u2` -> `format::is_os_yx_isv16_ternary`, folded at build time (section 3) |
+| `impls/ocl_v2/ternocl_int2/ternocl_int2_weights_reorder.cpp` | Weights reorder `u2` -> `format::is_os_yx_isv16_ternary` (FC) or `format::b_y_xs_f_xsv16_ternary` (MoE experts), folded at build time (sections 3, 8) |
+| `impls/ocl_v2/ternocl_int2/moe_3gemm_ternocl_int2.cpp` | `moe_3gemm_fused_compressed` with ternary routed experts (section 8) |
 | `impls/ocl_v2/CMakeLists.txt` | Embeds the TernOCL sources (up-convert, int2 x int8, FWHT, epilogue) as chunked string literals at configure time |
 | `thirdparty/TernOCL` | Submodule: [TernOCL](https://github.com/libxsmm/TernOCL) kernels, drivers, validation, tuning scripts |
 | `plugin/transformations/fuse_hadamard_fc.cpp` | Folds the graph-level rotation of rotated-basis checkpoints into the FC (section 7) |
 | `plugin/transformations/fuse_rms_rope.cpp` | Folds the per-head Q/K RMSNorm into RoPE when the rotation covers the whole head (Bonsai 1.7B-8B; Bonsai 2 27B's partial-rotary heads stay unfused). Controlled by `GPU_ENABLE_RMS_ROPE_FUSION` (default on) |
 | `registry/fully_connected_impls.cpp` | Priority relative to oneDNN/OpenCL |
+| `registry/moe_3gemm_swiglu_impls.cpp` | MoE impl ahead of `moe_3gemm_swiglu_opt`, which rejects `u2` |
 | `registry/reorder_impls.cpp` | Registers the weights reorder ahead of the stock reorders; it accepts only the TernOCL packed format and hands any other reorder to the stock CPU reorder when the CPU impl type is forced |
 | `primitive_inst.cpp` | Lets `ternocl_int2` keep its fused chain under dynamic shapes (section 4) |
 
@@ -319,3 +321,41 @@ The pass is registered only on the OpenCL or Level Zero runtime with TernOCL ena
 other implementation applies a fused rotation; otherwise (and with
 `GPU_ENABLE_HADAMARD_FC_FUSION=0` in debug-caps builds) the rotation stays in the graph.
 `OV_VERBOSE=4` traces the match per FC.
+
+---
+
+## 8. Ternary MoE experts
+
+Mixture-of-experts checkpoints with ternary routed experts (e.g. CAT-Q
+Qwen3-30B-A3B, `tools/int2/quantize_ir_ternary.py` on the experts' rank-3
+weights) reach the plugin as `u2` gate/up/down expert weights. When the TernOCL
+path is active (OpenCL or Level Zero runtime, `GPU_ENABLE_TERNOCL_INT2`, Xe2 with
+DPAS), the MoE fusion accepts `u2` and builds `moe_3gemm_fused_compressed`;
+`CreateMOECompressedOp` records the experts' common zero point on the primitive
+(`decompression_zero_point_scalar`, read from the constants, since impl
+selection runs in parallel and must not touch device memory).
+
+`moe_3gemm_ternocl_int2` accepts gate/up/down SwiGLU experts without shared
+experts, 128-groups, zero point 1, f16 activations, and is registered ahead of
+`moe_3gemm_swiglu_opt`, which rejects `u2`. Its inputs are prepared at build time
+like the FC's:
+
+- the expert weights (`[E, N, K]` or `[E, N, K/128, 128]`) get a weights reorder to
+  `format::b_y_xs_f_xsv16_ternary`, `[E, N, K]` with each expert packed as
+  `is_os_yx_isv16_ternary` (`[K/16, N]` dwords), inserted by `post_optimize_weights`
+  and folded by `propagate_constants`;
+- the scales are already `[E, K/128, N]`: `prepare_quantization` reorders every
+  MoE-3GEMM scale to `byfx`.
+
+Execution (`TernOCL/int2_moe/`), all on the device with no host synchronization:
+
+| Tokens T | Kernels |
+|---|---|
+| < 16 (decode) | `int2_moe_gate_up` (`silu(x . gate_e) * (x . up_e)` for every (token, expert) row), `int2_moe_down` (x routing weight, fp32), `int2_moe_reduce` (sum of a token's top-k rows); the expert index of each row is read from the router's output |
+| >= 16 (prefill) | `int2_moe_route` (rows per expert, permutation, row-tile offsets), `int2_moe_gather` (expert-sorted rows), up / gate (`silu * up` epilogue) / down as per-expert M-tiled int2 GEMMs, `int2_moe_combine`; three tile bands (T <= 64, <= 512, larger) |
+| >= 16, `GPU_TERNOCL_INT2_INT8_PREFILL` | the same on the int2 x int8 DPAS GEMM, the tokens quantized once (`quant_a`) before the gather |
+
+Each kernel is one program (`TERNOCL_SELECT_KERNELS`) built through the kernels
+cache; arguments and work sizes are set at each launch. Only the GEMMs are built
+with 256 GRF, which would halve the work-group limit of the single-work-group routing.
+

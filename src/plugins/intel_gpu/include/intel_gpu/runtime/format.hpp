@@ -253,6 +253,8 @@ struct format {
         is_os_yx_isv16_ternary,                       ///< u2 fully connected weights for the TernOCL int2 impl: K blocked by 16 into one
                                                       ///< dword per (K/16, N), values re-encoded from codes {0,1,2} (zero point 1)
                                                       ///< to 2-bit two's complement {-1,0,+1}
+        b_y_xs_f_xsv16_ternary,                       ///< u2 MoE expert weights [E, N, K] (K on x) for the TernOCL int2 MoE impl: per
+                                                      ///< expert the is_os_yx_isv16_ternary packing, i.e. one dword per (e, K/16, N)
 
         format_num,  ///< number of format types
         custom,      ///< means that this format is created based on custom format traits and may have no corresponding label
