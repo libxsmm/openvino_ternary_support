@@ -91,6 +91,8 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
         {2560, 18432, {128, 1, 1}},  // 4B gate_up (merged)
         {9216, 2560, {32, 8, 1}},    // 4B down
         {4096, 248320, {16, 1, 1}},  // 9B lm_head
+        // CAT-Q (Qwen3) 30B-A3B o_proj; its qkv is the Bonsai 2 2B one above
+        {4096, 2048, {32, 8, 1}},
     };
     // Arc 140V (Lunar Lake), M = 1, paced sweep (select decode).
     static const Entry igpu[] = {
@@ -127,6 +129,8 @@ GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
         {2560, 18432, {32, 2, 1}},
         {9216, 2560, {32, 6, 1}},
         {4096, 248320, {32, 2, 1}},
+        // CAT-Q (Qwen3) 30B-A3B o_proj: the default, so that the Arc Pro B70 entry does not apply
+        {4096, 2048, {32, 4, 1}},
     };
     if (integrated) {
         for (const auto& e : igpu) {
