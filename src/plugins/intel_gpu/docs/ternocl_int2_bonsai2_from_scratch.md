@@ -161,6 +161,11 @@ cd $WORK
     --out-dir        bonsai2-27b-u2
 ```
 
+The PTQ1_0 GGUF (`Ternary-Bonsai-2-27B-PTQ1_0.gguf`, 5.9 GB, base-3 packed) can
+be passed instead: it holds the same ternary codes and group-128 scales, which
+the tool repacks into the u2 layout, so the IR is byte-identical to the one
+built from PQ2_0. The same holds for the other sizes.
+
 Needs ~16 GB RAM. Expected log:
 
 ```
@@ -409,5 +414,5 @@ accepts and how many rotations were fused ("fused 257 input rotations"), and
 | `ternocl int2: kernel build failed (...)` | the OpenCL compiler rejected the TernOCL source; the build log follows the message |
 | `... carries a Hadamard input transform but the TernOCL impl rejected it` | an FC of the rotated model fell outside the impl's rules; the reason is in the message |
 | `ModuleNotFoundError: yaml` from the converter | `pip install pyyaml` (gguf-py of the fork imports it) |
-| converter: `need the PrismML llama.cpp fork's gguf-py` | pass `--gguf-py <fork>/gguf-py`; stock gguf lacks type id 142 (PQ2_0) |
+| converter: `need the PrismML llama.cpp fork's gguf-py` | pass `--gguf-py <fork>/gguf-py`; stock gguf lacks type ids 142 (PQ2_0) and 143 (PTQ1_0) |
 | fluent nonsense output | wrong tokenizer for decoding (Bonsai 2 uses the Qwen3.5 vocabulary) — or a converter/mapping error: run `--verify` |

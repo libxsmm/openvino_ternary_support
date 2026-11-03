@@ -51,7 +51,11 @@ gather, on the device.
     python bonsai2_gguf_to_ir.py --gguf <Ternary-Bonsai-27B-PQ2_0.gguf> \
         --template-dir ... --template-embed ... --verify
 
-Reading PQ2_0 needs the PrismML llama.cpp fork's gguf-py (type id 142).
+The PTQ1_0 GGUF (base-3 packing, 1.75 bits per weight) works the same way: its
+blocks hold the same codes and scales and are repacked into the PQ2_0 layout, so
+both GGUFs give the same IR.
+
+Reading PQ2_0/PTQ1_0 needs the PrismML llama.cpp fork's gguf-py (type ids 142/143).
 """
 from __future__ import annotations
 
@@ -117,13 +121,38 @@ def gguf_f32(t) -> np.ndarray:
     sys.exit(f"{t.name}: unsupported dense type {t.tensor_type.name}")
 
 
+def _ptq1_trits(q: np.ndarray, count: int) -> np.ndarray:
+    """Base-3 packed bytes [..., c] -> codes {0,1,2} [..., count * c], most significant trit first."""
+    q = q.astype(np.uint16)
+    return np.concatenate([(((q * 3 ** i) & 0xFF) * 3) >> 8 for i in range(count)], axis=-1)
+
+
+def _ptq1_to_pq2(raw: np.ndarray) -> np.ndarray:
+    """PTQ1_0 blocks [N, G, 28] (24 B qs, 2 B qh, fp16 d) -> PQ2_0 blocks [N, G, 34].
+
+    PTQ1_0 packs the same codes {0,1,2} and the same fp16 group-128 scale as PQ2_0,
+    5 trits per qs byte (elements 0..79 from qs[0:16], 80..119 from qs[16:24], each
+    stage trit-major) and 4 per qh byte (elements 120..127, trit-major)."""
+    codes = np.concatenate([_ptq1_trits(raw[..., 0:16], 5), _ptq1_trits(raw[..., 16:24], 5),
+                            _ptq1_trits(raw[..., 24:26], 4)], axis=-1)
+    codes = codes.astype(np.uint8).reshape(*raw.shape[:2], GROUP // 4, 4)
+    packed = codes[..., 0] | (codes[..., 1] << 2) | (codes[..., 2] << 4) | (codes[..., 3] << 6)
+    return np.concatenate([raw[..., 26:28], packed], axis=-1)
+
+
+TERNARY_TYPES = ("PQ2_0", "PTQ1_0")
+PTQ1_BLOCK_BYTES = 2 + 24 + 2
+
+
 def pq2_blocks(t) -> np.ndarray:
-    """PQ2_0 tensor -> uint8 [N, K/128, 34] (fp16 scale, then 32 code bytes)."""
+    """PQ2_0 or PTQ1_0 tensor -> uint8 [N, K/128, 34] in PQ2_0 layout (fp16 scale, then 32 code bytes)."""
     n, k = (int(x) for x in reversed(t.shape))
     raw = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-    if raw.size != n * (k // GROUP) * BLOCK_BYTES:
-        sys.exit(f"{t.name}: PQ2_0 byte length mismatch")
-    return raw.reshape(n, k // GROUP, BLOCK_BYTES)
+    src = PTQ1_BLOCK_BYTES if t.tensor_type.name == "PTQ1_0" else BLOCK_BYTES
+    if raw.size != n * (k // GROUP) * src:
+        sys.exit(f"{t.name}: {t.tensor_type.name} byte length mismatch")
+    raw = raw.reshape(n, k // GROUP, src)
+    return _ptq1_to_pq2(raw) if src != BLOCK_BYTES else raw
 
 
 def blocks_dequant(blocks: np.ndarray) -> np.ndarray:
@@ -391,7 +420,7 @@ def main():
             cols = perm_1                      # whole 128-groups move
 
         u2c, sc_c = u2_chain(mm)
-        if u2c is not None and t.tensor_type.name != "PQ2_0":
+        if u2c is not None and t.tensor_type.name not in TERNARY_TYPES:
             # ternary in the template, dense in this GGUF (Bonsai 2 keeps the
             # GDN gate projections in bf16): drop the decompression subgraph
             if a.verify:
@@ -408,8 +437,6 @@ def main():
                 ops.convert(wc, mm.input_value(1).get_element_type()).output(0))
             n_dense += 1
         elif u2c is not None:
-            if t.tensor_type.name != "PQ2_0":
-                sys.exit(f"{hf}: template is u2 but GGUF holds {t.tensor_type.name}")
             blocks = pq2_blocks(t)
             if rows is not None:
                 blocks = blocks[rows]
@@ -588,8 +615,8 @@ def main():
 
     # ---- embedding ------------------------------------------------------------
     t = tensors["token_embd.weight"]
-    if t.tensor_type.name != "PQ2_0":
-        sys.exit(f"token_embd is {t.tensor_type.name}, expected PQ2_0")
+    if t.tensor_type.name not in TERNARY_TYPES:
+        sys.exit(f"token_embd is {t.tensor_type.name}, expected one of {TERNARY_TYPES}")
     if a.verify:
         emb = core.read_model(a.template_embed)
         emb_c = next(n for n in emb.get_ordered_ops()
