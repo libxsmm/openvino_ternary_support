@@ -302,7 +302,17 @@ MtTile mt_tile(size_t K, size_t N, LaunchClass cls, bool integrated) {
 }
 
 // Arc Pro B70 sweep of the 27B shapes, per M-tiled launch class (M <= 16, <= 32, < 64, >= 64).
-MtTile int8_tile(size_t K, size_t N, LaunchClass cls) {
+MtTile int8_tile(size_t K, size_t N, LaunchClass cls, bool integrated) {
+    // Arc 140V, M = 2048 (2 GiB rotating weights): {8, 128, 16, 1} wins on every 27B shape, 6-13% over {8, 128, 8, 2}.
+    // EXPERIMENT: TERNOCL_LNL_TILE=1 uses it on integrated GPUs for M >= 64 (faster from ~512 prompt tokens, ~10%
+    // slower at 135)
+    static const bool lnl_tile = [] {
+        const char* e = std::getenv("TERNOCL_LNL_TILE");
+        return e && std::string(e) == "1";
+    }();
+    if (lnl_tile && integrated && cls == LaunchClass::tiled_large) {
+        return MtTile{8, 128, 16, 1};
+    }
     using Bands = std::array<MtTile, kTiledClasses>;
     const size_t band = tiled_band(cls);
     struct Entry {
@@ -490,7 +500,7 @@ public:
                 scalars = {static_cast<int32_t>(s.M), static_cast<int32_t>(s.K)};
                 break;
             case TernoclKernel::int8_gemm:
-                set_tiled_dispatch(wgs, int8_tile(s.K, s.N, cls), s);
+                set_tiled_dispatch(wgs, int8_tile(s.K, s.N, cls, is_integrated(params)), s);
                 scalars = {static_cast<int32_t>(s.M), static_cast<int32_t>(s.N), static_cast<int32_t>(s.K)};
                 break;
             case TernoclKernel::int8_gemv: {
@@ -553,6 +563,15 @@ protected:
         const auto ep = epilogue(params);
         const std::string epi = " -DPOSTOP=" + std::to_string(static_cast<int>(ep.postop)) + (ep.out_f32 ? " -DOUT_F32" : "");
         std::string opts = KernelGenerator::get_build_options(params);
+        // -cl-mad-enable costs the int8 DPAS GEMM ~40% at M = 2048 on Arc 140V (10x with QMODE 0): drop it for TernOCL.
+        // EXPERIMENT: TERNOCL_MAD=1 keeps it
+        static const bool keep_mad = [] {
+            const char* e = std::getenv("TERNOCL_MAD");
+            return e && std::string(e) == "1";
+        }();
+        if (const auto pos = opts.find(" -cl-mad-enable"); !keep_mad && pos != std::string::npos) {
+            opts.erase(pos, std::string(" -cl-mad-enable").size());
+        }
         switch (m_kind) {
         case TernoclKernel::upcvt:
             if (is_gemv(m_cls)) {
@@ -566,7 +585,7 @@ protected:
         case TernoclKernel::quant:
             return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1";
         case TernoclKernel::int8_gemm:
-            return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1" + tile_options(int8_tile(s.K, s.N, m_cls)) + epi;
+            return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1" + tile_options(int8_tile(s.K, s.N, m_cls, is_integrated(params))) + epi;
         case TernoclKernel::int8_gemv: {
             const auto t = int8_gemv_tile(s.K, s.N, m_cls);
             return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1 -DSGM=" + std::to_string(gemv_rows(m_cls)) + " -DNSG_N=" + std::to_string(t.nsg) +
@@ -660,7 +679,12 @@ public:
         auto packed_layout = wei_layout;
         packed_layout.format = format::is_os_yx_isv16_ternary;
         _weights_reorder_params = std::make_shared<WeightsReorderParams>(wei_layout, packed_layout);
-        const bool int8 = node.get_program().get_config().get_ternocl_int2_int8_prefill();
+        // EXPERIMENT: TERNOCL_INT8_PREFILL=1 turns the (internal) int8 prefill option on
+        static const bool env_int8 = [] {
+            const char* e = std::getenv("TERNOCL_INT8_PREFILL");
+            return e && std::atoi(e) != 0;
+        }();
+        const bool int8 = env_int8 || node.get_program().get_config().get_ternocl_int2_int8_prefill();
         auto add = [&](Stage::Ptr& stage) {
             add_stage(stage, params);
             OPENVINO_ASSERT(has_stage(stage), "[GPU] ternocl int2: failed to generate a kernel for ", node.id());
