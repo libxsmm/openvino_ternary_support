@@ -74,6 +74,7 @@ void* gpu_buffer::lock(const stream& stream, mem_lock_type type) {
             OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
         }
     }
+    _mapped_for_write = _mapped_for_write || type != mem_lock_type::read;
     _lock_count++;
     return _mapped_ptr;
 }
@@ -84,13 +85,19 @@ void gpu_buffer::unlock(const stream& stream) {
     _lock_count--;
     if (0 == _lock_count && _mapped_ptr != nullptr) {
         try {
-            cl::Event ev;
-            cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr, nullptr, &ev);
-            ev.wait();
+            // Wait only when the unmap copies host writes to the device, so that later work sees them.
+            if (_mapped_for_write) {
+                cl::Event ev;
+                cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr, nullptr, &ev);
+                ev.wait();
+            } else {
+                cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr);
+            }
         } catch (cl::Error const& err) {
             OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
         }
         _mapped_ptr = nullptr;
+        _mapped_for_write = false;
     }
 }
 
@@ -359,6 +366,7 @@ void* gpu_image2d::lock(const stream& stream, mem_lock_type type) {
             OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
         }
     }
+    _mapped_for_write = _mapped_for_write || type != mem_lock_type::read;
     _lock_count++;
     return _mapped_ptr;
 }
@@ -369,13 +377,19 @@ void gpu_image2d::unlock(const stream& stream) {
     _lock_count--;
     if (0 == _lock_count) {
         try {
-            cl::Event ev;
-            cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr, nullptr, &ev);
-            ev.wait();
+            // Wait only when the unmap copies host writes to the device, so that later work sees them.
+            if (_mapped_for_write) {
+                cl::Event ev;
+                cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr, nullptr, &ev);
+                ev.wait();
+            } else {
+                cl_stream.get_cl_queue().enqueueUnmapMemObject(_buffer, _mapped_ptr);
+            }
         } catch (cl::Error const& err) {
             OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
         }
         _mapped_ptr = nullptr;
+        _mapped_for_write = false;
     }
 }
 

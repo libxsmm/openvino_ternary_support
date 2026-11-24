@@ -12,6 +12,7 @@
 #include "test_utils.h"
 #include "random_generator.hpp"
 #include "network_test.h"
+#include <fstream>
 #include <intel_gpu/runtime/utils.hpp>
 #include <intel_gpu/primitives/input_layout.hpp>
 #include "intel_gpu/primitives/fully_connected.hpp"
@@ -7357,7 +7358,10 @@ public:
             }
 
             // int8 prefill quantizes the activations per 128-group (~1/127 relative per element).
-            const float tol = (p.int8_prefill && m > 8 ? 0.02f : 0.005f) * std::max(max_abs, 1.0f);
+            // EXPERIMENT: TERNOCL_INT8_GEMV_MIN_M also quantizes the activations of M >= that value (up to 8).
+            const char* i8g = std::getenv("TERNOCL_INT8_GEMV_MIN_M");
+            const bool int8_rows = (p.int8_prefill && m > 8) || (i8g && std::atoi(i8g) >= 2 && m >= std::atoi(i8g) && m <= 8);
+            const float tol = (int8_rows ? 0.02f : 0.005f) * std::max(max_abs, 1.0f);
             // A dynamic network may hand back a buffer larger than the current shape; only m * n values are valid.
             ASSERT_EQ(outputs.at(out_id).get_layout().count(), ref.size());
             auto out_mem = outputs.at(out_id).get_memory();
@@ -7371,6 +7375,14 @@ public:
             }
             for (size_t i = 0; i < ref.size(); ++i)
                 ASSERT_NEAR(ref[i], out[i], tol) << "m=" << m << " index " << i;
+            // EXPERIMENT: TERNOCL_TEST_DUMP=<dir> writes every output, to compare two knob settings bit for bit
+            if (const char* dump = std::getenv("TERNOCL_TEST_DUMP")) {
+                const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+                std::string name = std::string(info->test_suite_name()) + "." + info->name() + ".m" + std::to_string(m);
+                std::replace(name.begin(), name.end(), '/', '_');
+                std::ofstream(std::string(dump) + "/" + name + ".bin", std::ios::binary)
+                    .write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size() * sizeof(float)));
+            }
         }
     }
 };
@@ -7533,7 +7545,10 @@ TEST(fully_connected_gpu_ternocl_int2_dynamic, shared_weights) {
                         part += static_cast<float>(xs[f][r * k + kk]) * w[c * k + kk];
                     acc += part * static_cast<float>(scales[c * groups + g]);
                 }
-                ASSERT_NEAR(acc, static_cast<float>(out[r * n + c]), 0.005f * std::max(std::fabs(acc), 1.0f)) << id << " row " << r << " col " << c;
+                // EXPERIMENT: int8 GEMV (TERNOCL_INT8_GEMV_MIN_M <= 3) quantizes the activations
+                const char* i8g = std::getenv("TERNOCL_INT8_GEMV_MIN_M");
+                const float rel = (i8g && std::atoi(i8g) >= 2 && std::atoi(i8g) <= m) ? 0.02f : 0.005f;
+                ASSERT_NEAR(acc, static_cast<float>(out[r * n + c]), rel * std::max(std::fabs(acc), 1.0f)) << id << " row " << r << " col " << c;
             }
         }
     }

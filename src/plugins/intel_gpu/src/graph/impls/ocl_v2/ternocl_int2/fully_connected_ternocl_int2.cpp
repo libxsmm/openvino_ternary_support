@@ -8,6 +8,8 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -370,7 +372,70 @@ std::string tile_options(const MtTile& t) {
            " -DWG_N=" + std::to_string(t.wg_n) + " -cl-intel-256-GRF-per-thread";
 }
 
-enum class TernoclKernel { upcvt, quant, int8_gemm, fwht };
+// EXPERIMENT: int2 x int8 DPAS GEMV for small M (MTP verify batches). TERNOCL_INT8_GEMV_MIN_M=m (2..8) routes
+// M in [m, 8] through quant_a + int2_int8_gemv; 0 / unset keeps the up-convert GEMV. TERNOCL_INT8_GEMV_TILE="nsg,ls,u" forces a tile.
+size_t int8_gemv_min_m() {
+    static const size_t v = [] {
+        const char* e = std::getenv("TERNOCL_INT8_GEMV_MIN_M");
+        const size_t m = e ? static_cast<size_t>(std::atoi(e)) : size_t{0};
+        if (m >= 2) {
+            std::fprintf(stderr, "[ternocl-int2] EXPERIMENT: int2 x int8 GEMV for %zu <= M <= 8\n", m);
+        }
+        return m;
+    }();
+    return v;
+}
+
+bool int8_gemv_class(LaunchClass cls) {
+    const size_t m = int8_gemv_min_m();
+    return m >= 2 && is_gemv(cls) && gemv_rows(cls) >= m && cls != LaunchClass::gemv_m1;
+}
+
+struct I8GemvTile {
+    int nsg, ls, u;
+};
+
+// Arc 140V sweep of the 27B shapes (2 GiB rotating weights), per GEMV class M = 2, <= 4, <= 8.
+I8GemvTile int8_gemv_tile(size_t K, size_t N, LaunchClass cls) {
+    if (const char* e = std::getenv("TERNOCL_INT8_GEMV_TILE")) {
+        I8GemvTile t{4, 4, 2};
+        std::sscanf(e, "%d,%d,%d", &t.nsg, &t.ls, &t.u);
+        return t;
+    }
+    struct Entry {
+        size_t k, n;
+        std::array<I8GemvTile, 3> t;
+    };
+    static const Entry table[] = {
+        {5120, 34816, {{{4, 4, 2}, {4, 4, 2}, {4, 4, 2}}}},  // gate_up
+        {17408, 5120, {{{4, 8, 2}, {1, 8, 1}, {4, 8, 1}}}},  // down
+        {5120, 16384, {{{2, 4, 2}, {1, 4, 1}, {4, 4, 2}}}},  // in_proj_qkvz
+        {6144, 5120, {{{4, 1, 1}, {4, 1, 2}, {4, 8, 1}}}},   // out_proj / o_proj
+    };
+    const size_t band = class_index(cls) - 1;
+    for (const auto& e : table) {
+        if (e.k == K && e.n == N) {
+            return e.t.at(band);
+        }
+    }
+    return {4, 4, 2};
+}
+
+// EXPERIMENT: TERNOCL_FWHT_QUANT=1 makes the FWHT of rotated FCs also write the int8 path's activation scales,
+// so quant_a is skipped when the int8 GEMV / GEMM runs.
+bool fwht_quant_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("TERNOCL_FWHT_QUANT");
+        const bool on = e && std::atoi(e) != 0;
+        if (on) {
+            std::fprintf(stderr, "[ternocl-int2] EXPERIMENT: FWHT fused with quant_a\n");
+        }
+        return on;
+    }();
+    return v;
+}
+
+enum class TernoclKernel { upcvt, quant, int8_gemm, fwht, int8_gemv, fwht_quant };
 
 // One kernel per program: TERNOCL_SELECT_KERNELS drops the other kernels of the source.
 // The tile depends only on (K, N, launch class, device), so a stage serves every M of its class.
@@ -428,12 +493,24 @@ public:
                 set_tiled_dispatch(wgs, int8_tile(s.K, s.N, cls), s);
                 scalars = {static_cast<int32_t>(s.M), static_cast<int32_t>(s.N), static_cast<int32_t>(s.K)};
                 break;
-            case TernoclKernel::fwht: {
+            case TernoclKernel::int8_gemv: {
+                const auto t = int8_gemv_tile(s.K, s.N, cls);
+                const size_t wgn = 16 * static_cast<size_t>(t.nsg);
+                wgs.local = {wgn * static_cast<size_t>(t.ls), 1, 1};
+                wgs.global = {ceil_div(s.N, wgn) * wgs.local[0], ceil_div(s.M, gemv_rows(cls)), 1};
+                scalars = {static_cast<int32_t>(s.M), static_cast<int32_t>(s.N), static_cast<int32_t>(s.K)};
+                break;
+            }
+            case TernoclKernel::fwht:
+            case TernoclKernel::fwht_quant: {
                 // One work-group of B/8 items per B-wide block.
                 const size_t block = params.typed_desc<fully_connected>()->hadamard_block;
                 wgs.local = {block / 8, 1, 1};
                 wgs.global = {s.M * (s.K / block) * (block / 8), 1, 1};
                 scalars = {static_cast<int32_t>(s.K), params.typed_desc<fully_connected>()->hadamard_signs.empty() ? 0 : 1};
+                if (kind == TernoclKernel::fwht_quant) {
+                    scalars.push_back(static_cast<int32_t>(s.M));
+                }
                 break;
             }
             }
@@ -460,9 +537,12 @@ protected:
         case TernoclKernel::quant:  // A, SA, Aq (not written in QMODE 1), M, K
             return {a, sa, a, {T::SCALAR, 0}, {T::SCALAR, 1}};
         case TernoclKernel::int8_gemm:  // A, Aq (unused), SA, B, SB, C, Other, Bias, M, N, K
+        case TernoclKernel::int8_gemv:
             return {a, a, sa, {T::INPUT, 1}, {T::INPUT, 2}, {T::OUTPUT, 0}, {T::INPUT, 3}, {T::INPUT, 4}, {T::SCALAR, 0}, {T::SCALAR, 1}, {T::SCALAR, 2}};
         case TernoclKernel::fwht:  // x, signs, H_B(s * x) / sqrt(B), K, has_signs
             return {{T::INPUT, 0}, {T::INPUT, 5}, {T::INTERNAL_BUFFER, 0}, {T::SCALAR, 0}, {T::SCALAR, 1}};
+        case TernoclKernel::fwht_quant:  // ... plus SA, M
+            return {{T::INPUT, 0}, {T::INPUT, 5}, {T::INTERNAL_BUFFER, 0}, {T::SCALAR, 0}, {T::SCALAR, 1}, sa, {T::SCALAR, 2}};
         }
         OPENVINO_THROW("[GPU] ternocl int2: unknown kernel");
     }
@@ -487,8 +567,15 @@ protected:
             return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1";
         case TernoclKernel::int8_gemm:
             return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1" + tile_options(int8_tile(s.K, s.N, m_cls)) + epi;
+        case TernoclKernel::int8_gemv: {
+            const auto t = int8_gemv_tile(s.K, s.N, m_cls);
+            return opts + " -cl-fp32-correctly-rounded-divide-sqrt -DQMODE=1 -DSGM=" + std::to_string(gemv_rows(m_cls)) + " -DNSG_N=" + std::to_string(t.nsg) +
+                   " -DLS=" + std::to_string(t.ls) + " -DU=" + std::to_string(t.u) + epi;
+        }
         case TernoclKernel::fwht:
             return opts + " -DHB=" + std::to_string(params.typed_desc<fully_connected>()->hadamard_block);
+        case TernoclKernel::fwht_quant:
+            return opts + " -DFWHT_QUANT -DHB=" + std::to_string(params.typed_desc<fully_connected>()->hadamard_block);
         }
         OPENVINO_THROW("[GPU] ternocl int2: unknown kernel");
     }
@@ -502,8 +589,12 @@ private:
             return "quant";
         case TernoclKernel::int8_gemm:
             return "int8_" + std::to_string(class_index(cls));
+        case TernoclKernel::int8_gemv:
+            return "i8gemv_" + std::to_string(class_index(cls));
         case TernoclKernel::fwht:
             return "fwht";
+        case TernoclKernel::fwht_quant:
+            return "fwhtq";
         }
         return {};
     }
@@ -516,7 +607,10 @@ private:
             return "quant_a";
         case TernoclKernel::int8_gemm:
             return "int2_int8_gemm_mt";
+        case TernoclKernel::int8_gemv:
+            return "int2_int8_gemv";
         case TernoclKernel::fwht:
+        case TernoclKernel::fwht_quant:
             return "hadamard_fwht";
         }
         return {};
@@ -528,8 +622,10 @@ private:
             return kTernoclUpcvtSource;
         case TernoclKernel::quant:
         case TernoclKernel::int8_gemm:
+        case TernoclKernel::int8_gemv:
             return kTernoclInt8Source;
         case TernoclKernel::fwht:
+        case TernoclKernel::fwht_quant:
             return kTernoclFwhtSource;
         }
         return "";
@@ -553,6 +649,8 @@ public:
     Stage::Ptr quant = make_stage<TernoclStageGenerator>(TernoclKernel::quant, LaunchClass::gemv_m1);
     std::array<Stage::Ptr, kTiledClasses> int8_gemm = make_stages<kTiledClasses>(TernoclKernel::int8_gemm, kGemvClasses);
     Stage::Ptr fwht = make_stage<TernoclStageGenerator>(TernoclKernel::fwht, LaunchClass::gemv_m1);
+    std::array<Stage::Ptr, kGemvClasses> int8_gemv = make_stages<kGemvClasses>(TernoclKernel::int8_gemv, 0);
+    Stage::Ptr fwht_quant = make_stage<TernoclStageGenerator>(TernoclKernel::fwht_quant, LaunchClass::gemv_m1);
 
     fully_connected_ternocl_int2() : PrimitiveImplOCL("ternocl_int2") {}
     fully_connected_ternocl_int2(const program_node& node, const RuntimeParams& params) : fully_connected_ternocl_int2() {
@@ -567,8 +665,11 @@ public:
             add_stage(stage, params);
             OPENVINO_ASSERT(has_stage(stage), "[GPU] ternocl int2: failed to generate a kernel for ", node.id());
         };
+        const auto static_cls = params.is_dynamic() ? LaunchClass::gemv_m1 : launch_class(fc_shape(params).M);
+        const bool static_int8 = !params.is_dynamic() && ((int8 && !is_gemv(static_cls)) || int8_gemv_class(static_cls));
+        const bool static_fused = static_int8 && desc->hadamard_block != 0 && fwht_quant_on();
         if (desc->hadamard_block != 0) {
-            add(fwht);
+            add(static_fused ? fwht_quant : fwht);
         }
         if (params.is_dynamic()) {
             for (size_t i = 0; i < (int8 ? kGemvClasses : kLaunchClasses); ++i) {
@@ -580,11 +681,29 @@ public:
                     add(stage);
                 }
             }
+            for (size_t i = 0; i < kGemvClasses; ++i) {
+                if (int8_gemv_class(class_at(i))) {
+                    if (!has_stage(quant)) {
+                        add(quant);
+                    }
+                    add(int8_gemv[i]);
+                }
+            }
+            if (desc->hadamard_block != 0 && has_stage(quant) && fwht_quant_on()) {
+                add(fwht_quant);
+            }
         } else {
             const auto cls = launch_class(fc_shape(params).M);
             if (int8 && !is_gemv(cls)) {
-                add(quant);
+                if (!static_fused) {
+                    add(quant);
+                }
                 add(int8_gemm[tiled_band(cls)]);
+            } else if (int8_gemv_class(cls)) {
+                if (!static_fused) {
+                    add(quant);
+                }
+                add(int8_gemv[class_index(cls)]);
             } else {
                 add(upcvt[class_index(cls)]);
             }
@@ -605,7 +724,7 @@ public:
         }
         const auto s = fc_shape(params);
         std::vector<BufferDescriptor> descs;
-        if (has_stage(fwht)) {
+        if (rotated()) {
             descs.emplace_back(s.M * s.K, ov::element::f16);
         }
         if (runs_int8(s.M)) {
@@ -621,12 +740,17 @@ public:
         const size_t M = fc_shape(params).M;
         const auto cls = launch_class(M);
         std::vector<size_t> order;
+        if (runs_int8(M) && has_stage(fwht_quant)) {
+            order.push_back(stage_index(fwht_quant));
+            order.push_back(stage_index(is_gemv(cls) ? int8_gemv[class_index(cls)] : int8_gemm[tiled_band(cls)]));
+            return order;
+        }
         if (has_stage(fwht)) {
             order.push_back(stage_index(fwht));
         }
         if (runs_int8(M)) {
             order.push_back(stage_index(quant));
-            order.push_back(stage_index(int8_gemm[tiled_band(cls)]));
+            order.push_back(stage_index(is_gemv(cls) ? int8_gemv[class_index(cls)] : int8_gemm[tiled_band(cls)]));
         } else {
             order.push_back(stage_index(upcvt[class_index(cls)]));
         }
@@ -641,7 +765,7 @@ public:
         }
         update_rt_params(instance);
         std::vector<event::ptr> deps = events;
-        if (has_stage(fwht) && !_had_signs) {
+        if (rotated() && !_had_signs) {
             // Not uploaded at impl creation: impls are created in parallel, and the service stream
             // is not thread-safe on Level Zero.
             const auto& signs = instance.get_impl_params()->typed_desc<fully_connected>()->hadamard_signs;
@@ -704,9 +828,21 @@ private:
         return static_cast<size_t>(std::find(_stages.begin(), _stages.end(), stage.get()) - _stages.begin());
     }
 
-    // The int8 prefill runs when its stages are built and M is in an M-tiled class.
+    // A fused Hadamard input transform runs (alone or with the int8 scales).
+    [[nodiscard]] bool rotated() const {
+        return has_stage(fwht) || has_stage(fwht_quant);
+    }
+
+    // The int8 path runs when the stage for M's class is built.
     [[nodiscard]] bool runs_int8(size_t M) const {
-        return has_stage(quant) && (!is_dynamic() || !is_gemv(launch_class(M)));
+        if (!is_dynamic()) {
+            return has_stage(quant) || has_stage(fwht_quant);
+        }
+        if (!has_stage(quant)) {
+            return false;
+        }
+        const auto cls = launch_class(M);
+        return is_gemv(cls) ? has_stage(int8_gemv[class_index(cls)]) : has_stage(int8_gemm[tiled_band(cls)]);
     }
 };
 
