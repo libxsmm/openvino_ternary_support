@@ -317,6 +317,30 @@ public:
     void clear_events();
     void reset_out_event();
 
+    // SCRATCH (OV_GPU_REPLAY): output state after a recorded run; restored for primitives that run between replayed segments.
+    struct replay_state {
+        std::vector<layout> lays;
+        std::vector<memory::ptr> mems;
+        std::vector<size_t> caps;
+        bool opt = false;
+        memory::ptr sinfo;
+    };
+    replay_state replay_save() const {
+        return {_impl_params->output_layouts, _outputs, _max_output_layout_count, _can_be_optimized, _shape_info_memory};
+    }
+    void replay_restore(const replay_state& s, bool with_memory, bool with_shape_info) {
+        _impl_params->output_layouts = s.lays;
+        set_can_be_optimized(s.opt);
+        if (with_memory) {
+            _outputs = s.mems;
+            _max_output_layout_count = s.caps;
+        }
+        if (with_shape_info) {
+            _shape_info_memory = s.sinfo;
+        }
+    }
+    const std::vector<primitive_inst*>& dependant_shape_of_insts() const { return _dependant_shape_of_insts; }
+
     void prepare_primitive();
     void execute();
     void init_kernels(const kernels_cache& kernels_cache) {

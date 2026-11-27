@@ -41,6 +41,7 @@ public:
                 const std::list<std::shared_ptr<primitive_inst>>& primitives);
 
     /// @brief Invalidates the recorded command list.
+    bool valid() const { return _valid; }
     void invalidate() {
         _valid = false;
         GPU_DEBUG_TRACE_DETAIL << "[REC] Recorded command list was invalidated";

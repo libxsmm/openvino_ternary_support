@@ -52,6 +52,7 @@ protected:
 
     void stop_recording() {
         if (m_command_recorder && m_command_recorder->stop_recording() != nullptr) {
+            note_rec_abort("event_wait");
             GPU_DEBUG_TRACE << "[REC] Recording interrupted by event::wait" << std::endl;
         }
     }

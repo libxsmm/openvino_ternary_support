@@ -7,10 +7,27 @@
 #include "command_list.hpp"
 #include "openvino/core/except.hpp"
 
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace cldnn {
+// SCRATCH (OV_GPU_REPLAY diagnostics): primitive being prepared/executed, and recording abort sites.
+inline thread_local const std::string* g_rec_cur_prim = nullptr;
+inline std::map<std::string, size_t>& rec_abort_sites() {
+    static std::map<std::string, size_t> m;
+    return m;
+}
+// SCRATCH: > 0 while the host writes data that depends only on shapes (shape_info); such a lock keeps a recording.
+inline thread_local int g_rec_benign_lock = 0;
+struct rec_benign_lock_scope {
+    rec_benign_lock_scope() { ++g_rec_benign_lock; }
+    ~rec_benign_lock_scope() { --g_rec_benign_lock; }
+};
+inline void note_rec_abort(const char* kind) {
+    rec_abort_sites()[std::string(kind) + " @ " + (g_rec_cur_prim ? *g_rec_cur_prim : std::string("?"))]++;
+}
 /// @brief Interface for recording commands on associated stream.
 /// @note command_recorder interface is not thread safe and must be used from the same thread as the associated stream
 class command_recorder {

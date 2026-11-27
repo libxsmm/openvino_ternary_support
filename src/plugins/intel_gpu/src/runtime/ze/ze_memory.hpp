@@ -11,6 +11,7 @@
 #include "intel_gpu/runtime/memory.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <mutex>
 #include <memory>
 #include <variant>
@@ -29,7 +30,13 @@ struct lockable_gpu_mem : public memory {
         _copy_back_to_device(false) {}
 
     void* lock(const stream& stream, mem_lock_type type) override final {
+        // SCRATCH OV_GPU_REPLAY: host-visible USM is just mapped; a shape-only host write keeps the recording.
+        const auto at = get_allocation_type();
+        if (g_rec_benign_lock > 0 && (at == allocation_type::usm_host || at == allocation_type::usm_shared)) {
+            return lock_impl(stream, type);
+        }
         if (stream.get_recorder()->stop_recording()) {
+            note_rec_abort("lock");
             GPU_DEBUG_TRACE << "[REC] Recording interrupted by memory::lock" << std::endl;
         }
         return lock_impl(stream, type);

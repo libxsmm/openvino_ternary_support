@@ -198,6 +198,7 @@ public:
     bool is_internal() const { return _internal; }
     bool is_primary_stream() const { return _is_primary_stream; }
     bool is_dynamic() const { return _is_dynamic; }
+    bool replay_force_args(const primitive_inst* inst) const;
     size_t get_weights_cache_capacity() const { return _weights_cache_capacity; }
     bool contains_state(const std::string& variable_id);
     memory& get_output_remote_memory(const primitive_id& id) const;
@@ -262,6 +263,23 @@ private:
     engine& _engine;
     stream::ptr _stream;
     record_replay_session::ptr _record_replay_session = nullptr;
+    // SCRATCH OV_GPU_REPLAY: one recorded plan per input signature (shapes + buffers), replayed while the signature repeats.
+    bool _replay_by_shape = false;
+    size_t _replay_count = 0, _record_count = 0, _record_aborted = 0;
+    std::map<std::string, size_t> _replay_inval;
+    struct replay_out { primitive_inst* inst; size_t idx; layout lay; memory::ptr mem; };
+    struct replay_data;
+    std::shared_ptr<replay_data> _rp;
+    const std::vector<replay_out>* _replay_out = nullptr;
+    // Per-signature shape_info buffer (same offsets as _shape_info_ptr), so a recording keeps its own shapes.
+    std::unordered_map<std::string, memory::ptr> _replay_sinfo;
+    std::string _replay_sinfo_sig;
+    memory::ptr _replay_sinfo_cur;
+    // Aborted recordings per signature; from 4 on the signature runs the normal path.
+    std::unordered_map<std::string, int> _replay_aborts;
+    bool _replay_force_args = false;
+    void replay_swap_shape_info(const std::string& signature);
+    bool replay_run(const std::string& signature, const std::vector<event::ptr>& events);
     std::unique_ptr<memory_pool> _memory_pool;
     bool _internal;
     bool _is_primary_stream;
@@ -303,7 +321,7 @@ private:
     std::shared_ptr<ShapePredictor> _shape_predictor;
 
     /// @brief Invalidate the recording of the previous iteration
-    void invalidate_recording();
+    void invalidate_recording(const std::string& reason = "other");
     /// @brief Prepares record and replay session
     /// @note expects that exec_order is constructed
     void prepare_record_replay();

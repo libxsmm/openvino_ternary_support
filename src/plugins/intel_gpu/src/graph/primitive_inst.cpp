@@ -3,6 +3,7 @@
 //
 
 #include "primitive_inst.h"
+#include "intel_gpu/runtime/command_recorder.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -511,7 +512,13 @@ void primitive_inst::update_shape() {
 
     _impl_params->memory_deps = memory_deps;
 
+    // SCRATCH (OV_GPU_REPLAY): without runtime deps the shape inference reads host-written data only.
+    std::optional<rec_benign_lock_scope> host_only;
+    if (!has_runtime_deps) {
+        host_only.emplace();
+    }
     auto new_layouts = get_node().type()->calc_output_layouts(*_node, *_impl_params);
+    host_only.reset();
     for (size_t idx = 0; idx != new_layouts.size(); ++idx) {
         auto& new_layout = new_layouts[idx];
         auto new_pshape = new_layout.get_partial_shape();
@@ -1744,6 +1751,7 @@ void primitive_inst::update_shape_info_tensor(const kernel_impl_params& params) 
         allocate_shape_info_memory();
     }
 
+    rec_benign_lock_scope benign;
     mem_lock<int32_t> lock(_shape_info_memory, get_network().get_stream());
     auto* shape_info_ptr = lock.data();
     size_t offset = 0;
@@ -2054,6 +2062,21 @@ void primitive_inst::do_runtime_skip_gather() {
         return;
     }
     if (input_shape[axis] != 1) {
+        // SCRATCH: OV_GPU_RUNTIME_SKIP_GATHER_SYNC=0 never drains the queue to read the indices; the gather just runs
+        static const bool no_sync = [] {
+            const char* e = std::getenv("OV_GPU_RUNTIME_SKIP_GATHER_SYNC");
+            return e && std::string(e) == "0";
+        }();
+        if (no_sync) {
+            if (_impl_params->output_layouts[0].data_padding.is_dynamic()) {
+                _impl_params->output_layouts[0].data_padding = padding();
+            }
+            if (can_be_optimized()) {
+                set_flag(ExecutionFlags::SHAPE_CHANGED);
+            }
+            set_can_be_optimized(false);
+            return;
+        }
         auto queue_type = get_network().get_stream().get_queue_type();
         if (queue_type == QueueTypes::out_of_order) {
             get_network().get_stream().wait_for_events({_deps[1].first->get_impl_params()->out_event});
@@ -2698,7 +2721,7 @@ void primitive_inst::prepare_primitive() {
             });
         };
 
-    bool need_args_update = get_flag(ExecutionFlags::IMPL_CHANGED) || get_flag(ExecutionFlags::MEMORY_CHANGED);
+    bool need_args_update = get_flag(ExecutionFlags::IMPL_CHANGED) || get_flag(ExecutionFlags::MEMORY_CHANGED) || get_network().replay_force_args(this);
 
     // Output buffer may be changed under the following conditions, so we need to set args to kernel on each iteration
     if ((is_dynamic() && need_args_update) || has_mutable_input() || is_output() || has_dynamic_dependencies_insts(this) || _use_shared_kernels) {

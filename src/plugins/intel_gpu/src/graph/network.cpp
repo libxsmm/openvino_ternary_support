@@ -3,8 +3,15 @@
 //
 
 #include "intel_gpu/graph/network.hpp"
+#include "intel_gpu/runtime/command_recorder.hpp"
+#include <cstring>
+#include <optional>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <unordered_map>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -307,7 +314,136 @@ network::network(program::ptr program, uint16_t stream_id)
 
 network::network(program::ptr program, stream::ptr stream, uint16_t stream_id) : network(program, stream, false, stream_id == 0) {}
 
+// SCRATCH (OV_GPU_REPLAY). A plan = recorded command-list segments, with the primitives that need the host on
+// every run ("live": paged_attention) executed normally between the segments.
+struct network::replay_data {
+    struct prim_state {
+        primitive_inst* inst;
+        bool live;
+        primitive_inst::replay_state st;
+    };
+    struct item {
+        record_replay_session::ptr session;
+        std::shared_ptr<primitive_inst> live;  // runs after the session
+        size_t live_state = 0;                 // its index in plan::snap
+    };
+    struct plan {
+        std::vector<item> items;
+        std::vector<prim_state> snap;  // state of the live primitives and their inputs after the recording
+        std::vector<memory::ptr> keep;
+        std::vector<event::ptr> events;  // signalled by the recorded commands
+        std::vector<replay_out> outs;
+    };
+    std::unordered_map<std::string, std::shared_ptr<plan>> plans;
+    std::unordered_set<const primitive_inst*> live;
+    std::vector<prim_state> base;  // the same state after the last normal run
+    bool dirty = false;            // a replay changed that state
+    size_t max_plans = 0, live_runs = 0, fixups = 0, evictions = 0, skipped = 0;
+    // Input shapes of the last normal run. A run after a shape change does host work (shape_of subgraphs,
+    // in-place crops) that interrupts a recording, so recordings are tried per shape transition.
+    size_t last_shapes = 0;
+    std::unordered_map<size_t, int> transition_aborts;
+    std::unordered_set<const primitive_inst*> unsigned_inputs;
+    size_t live_signed = ~size_t{0};
+    // OV_GPU_REPLAY_STATS=1: wall ms until the queue is empty, per pass type {replayed, recorded, aborted, not tried}.
+    const bool stats = std::getenv("OV_GPU_REPLAY_STATS") != nullptr;
+    double ms[4] = {0, 0, 0, 0};
+    void add_time(int kind, network& net, std::chrono::steady_clock::time_point t0) {
+        if (stats) {
+            net.get_stream().finish();
+            ms[kind] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+    }
+
+    // Other primitives depend on state that their neighbours compute during a normal run.
+    bool add_live(const primitive_inst* inst) {
+        return inst->desc()->type_string() == "paged_attention" && live.insert(inst).second;
+    }
+
+    std::vector<prim_state> snapshot(const network& net) const {
+        std::vector<prim_state> v;
+        if (live.empty()) {
+            return v;
+        }
+        std::unordered_set<const primitive_inst*> seen;
+        for (const auto& inst : net._exec_order) {
+            if (live.count(inst.get()) == 0) {
+                continue;
+            }
+            for (const auto& d : inst->dependencies()) {
+                if (live.count(d.first) == 0 && seen.insert(d.first).second) {
+                    auto* dep = const_cast<primitive_inst*>(d.first);
+                    v.push_back({dep, false, dep->replay_save()});
+                }
+            }
+            v.push_back({inst.get(), true, inst->replay_save()});
+        }
+        return v;
+    }
+
+    static void restore(const std::vector<prim_state>& v) {
+        for (const auto& s : v) {
+            if (s.inst->is_input()) {
+                // An input keeps the memory bound for this run.
+                if (const auto m = s.inst->output_memory_ptr()) {
+                    s.inst->set_output_layout(m->get_layout());
+                }
+            } else {
+                s.inst->replay_restore(s.st, true, s.live);
+            }
+        }
+    }
+};
+
+bool network::replay_force_args(const primitive_inst* inst) const {
+    return _replay_force_args || (_rp != nullptr && _rp->live.count(inst) != 0);
+}
+
+void print_prim_host_prof(const void* net);
 network::~network() {
+    print_prim_host_prof(this);
+    if (_replay_by_shape) {
+        std::cerr << "[replay] net " << this << " prims " << _exec_order.size() << " replays " << _replay_count << " recordings " << _record_count
+                  << " aborted " << _record_aborted << " not_tried " << _rp->skipped << " plans " << _rp->plans.size() << " live " << _rp->live.size()
+                  << " live_runs " << _rp->live_runs << " fixups " << _rp->fixups << " evictions " << _rp->evictions << " unsigned_inputs "
+                  << _rp->unsigned_inputs.size() << std::endl;
+        if (_rp->stats) {
+            const size_t n[4] = {_replay_count, _record_count - _record_aborted, _record_aborted, _rp->skipped};
+            std::cerr << "[replay]   ms/pass replayed " << _rp->ms[0] / std::max<size_t>(n[0], 1) << " recorded " << _rp->ms[1] / std::max<size_t>(n[1], 1)
+                      << " aborted " << _rp->ms[2] / std::max<size_t>(n[2], 1) << " not_tried " << _rp->ms[3] / std::max<size_t>(n[3], 1) << std::endl;
+        }
+        std::map<std::string, size_t> live_types;
+        for (const auto* inst : _rp->live) {
+            live_types[inst->desc()->type_string()]++;
+        }
+        for (const auto& [t, n] : live_types) {
+            std::cerr << "[replay]   live " << t << " x" << n << std::endl;
+        }
+        for (const auto& [r, n] : _replay_inval) {
+            std::cerr << "[replay]   inval " << r << " x" << n << std::endl;
+        }
+        for (const auto& [r, n] : rec_abort_sites()) {
+            const auto at = r.find(" @ ");
+            const auto pid = at == std::string::npos ? r : r.substr(at + 3);
+            auto it = _primitives.find(pid);
+            if (it == _primitives.end()) {
+                continue;
+            }
+            std::cerr << "[replay]   abort " << r << " x" << n;
+            const auto& node = it->second->get_node();
+            std::cerr << " impl " << (it->second->get_impl() ? it->second->get_impl()->get_kernel_name() : "none")
+                      << " shapeof " << node.is_in_shape_of_subgraph() << " cpu " << (node.get_preferred_impl_type() == impl_types::cpu)
+                      << " out " << it->second->get_output_layout().to_short_string() << " deps";
+            for (const auto& d : node.get_dependencies()) {
+                std::cerr << " " << d.first->id();
+            }
+            std::cerr << " users";
+            for (const auto* u : node.get_users()) {
+                std::cerr << " " << u->id();
+            }
+            std::cerr << std::endl;
+        }
+    }
     if (_program != nullptr) {
         _program->cancel_compilation_context();
     }
@@ -455,8 +591,8 @@ event::ptr network::set_input_data(const primitive_id& id, memory::ptr data, boo
     const bool same_buffer = prev_mem && new_mem &&
                              get_engine().is_the_same_buffer(*prev_mem, *new_mem) &&
                              compare_expanded_layout(prev_mem->get_layout(), new_mem->get_layout());
-    if (!same_buffer) {
-        invalidate_recording();
+    if (!same_buffer && !_replay_by_shape) {
+        invalidate_recording("in:" + id);
     }
 
     if (was_unallocated) {
@@ -630,7 +766,7 @@ std::vector<event::ptr> network::set_output_memory(const primitive_id& id, memor
     const bool same_buffer =
         prev_out && get_engine().is_the_same_buffer(*prev_out, *mem_new) && compare_expanded_layout(prev_out->get_layout(), mem_new->get_layout());
     if (!same_buffer) {
-        invalidate_recording();
+        invalidate_recording("out:" + id);
     }
 
     auto iter = std::find(_outputs.begin(), _outputs.end(), p_inst);
@@ -1010,13 +1146,13 @@ void network::register_output_memory_block(const primitive_id& id, ov::intel_gpu
     // Writers may still hold another request's memory; with unchanged shapes nothing else reallocates them.
     invalidate_ext_block_compute_nodes(id);
 	
-    invalidate_recording();
+    invalidate_recording("regblk:" + id);
 }
 
 void network::unregister_output_memory_block(const primitive_id& id) {
     auto it = _output_memory_blocks.find(id);
     if (it != _output_memory_blocks.end()) {
-        invalidate_recording();
+        invalidate_recording("unregblk:" + id);
         _output_memory_blocks.erase(it);
         invalidate_ext_block_compute_nodes(id);
     }
@@ -1053,7 +1189,7 @@ ov::intel_gpu::OutputMemoryBlock* network::get_output_memory_block(const primiti
 
 void network::clear_output_memory_blocks() {
     if (!_output_memory_blocks.empty()) {
-        invalidate_recording();
+        invalidate_recording("clearblk");
     }
     // Move map out first so _output_memory_blocks is empty even if invalidation throws.
     auto blocks = std::move(_output_memory_blocks);
@@ -1123,7 +1259,18 @@ std::map<primitive_id, network_output> network::execute(const std::vector<event:
             ev = inst->get_impl_params()->out_event;
         }
 
-        result.emplace(id, network_output(ev, inst->output_memory_ptr(0), get_stream_ptr(), inst->get_output_layout(0)));
+        auto mem = inst->output_memory_ptr(0);
+        auto lay = inst->get_output_layout(0);
+        // A replay leaves the primitives untouched, so its outputs come from the recording.
+        if (_replay_out != nullptr) {
+            for (const auto& o : *_replay_out) {
+                if (o.inst == inst.get() && o.idx == 0) {
+                    mem = o.mem;
+                    lay = o.lay;
+                }
+            }
+        }
+        result.emplace(id, network_output(ev, mem, get_stream_ptr(), lay));
     }
 
     return result;
@@ -1142,17 +1289,130 @@ bool network::has_event(const primitive_id& id) const {
     return it->second->get_impl_params()->out_event != nullptr;
 }
 
+namespace {
+// SCRATCH (not for commit): OV_PRIM_HOST_PROF=1 accumulates host time per primitive type and network
+struct PrimHostProf {
+    struct Acc { double prep = 0, exec = 0; size_t n = 0; };
+    std::unordered_map<const void*, std::unordered_map<std::string, Acc>> by_net;
+    std::unordered_map<const void*, size_t> runs;
+    void print(const void* net) {
+        auto it = by_net.find(net);
+        if (it == by_net.end()) return;
+        auto& m = it->second;
+        {
+            std::vector<std::pair<std::string, Acc>> v(m.begin(), m.end());
+            double tot = 0; for (auto& e : v) tot += e.second.prep + e.second.exec;
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.prep + a.second.exec > b.second.prep + b.second.exec; });
+            const double r = static_cast<double>(runs[net]);
+            std::cerr << "[prim_host_prof] net " << net << " runs " << runs[net] << " host us/run " << tot / r << "\n";
+            for (size_t i = 0; i < v.size() && i < 20; ++i)
+                std::cerr << "    " << v[i].first << " n/run " << v[i].second.n / r << " prep us/run " << v[i].second.prep / r << " exec us/run " << v[i].second.exec / r << "\n";
+        }
+    }
+};
+PrimHostProf& prim_host_prof() { static PrimHostProf p; return p; }
+bool prim_host_prof_on() { static const bool on = std::getenv("OV_PRIM_HOST_PROF") != nullptr; return on; }
+}  // namespace
+
+void print_prim_host_prof(const void* net) {
+    if (prim_host_prof_on()) prim_host_prof().print(net);
+}
+
 void network::execute_impl(const std::vector<event::ptr>& events) {
     bool is_recording = false;
-    if (_record_replay_session) {
-        if (_record_replay_session->replay(events, _exec_order)) {
+    _replay_out = nullptr;
+    std::string signature;
+    std::shared_ptr<replay_data::plan> plan;
+    bool plan_ok = true, seg_open = false, live_added = false, abandoned = false;
+    size_t shapes = 0, transition = 0;
+    const auto t_start = std::chrono::steady_clock::now();
+    if (_replay_by_shape) {
+        auto& rp = *_rp;
+        // Shapes and input buffers: a recording bakes both into its kernel arguments.
+        // The input's own layout is refreshed only in update_shape(), so take the bound memory's layout.
+        std::string shape_signature;
+        if (rp.live.size() != rp.live_signed) {
+            // An input that only live primitives read is handled by them on every run.
+            rp.live_signed = rp.live.size();
+            rp.unsigned_inputs.clear();
+            for (const auto& in : _inputs) {
+                const auto& users = in->get_user_insts();
+                if (!users.empty() && std::all_of(users.begin(), users.end(), [&](const primitive_inst* u) { return rp.live.count(u) != 0; })) {
+                    rp.unsigned_inputs.insert(in.get());
+                }
+            }
+        }
+        signature = std::to_string(rp.live.size()) + '#';
+        for (const auto& in : _inputs) {
+            if (rp.unsigned_inputs.count(in.get()) != 0) {
+                continue;
+            }
+            const auto& m = in->output_memory_ptr();
+            shape_signature += (m ? m->get_layout() : in->get_output_layout()).get_partial_shape().to_string();
+            const void* p = m ? (m->buffer_ptr() ? m->buffer_ptr() : static_cast<const void*>(m.get())) : nullptr;
+            signature += '@' + std::to_string(reinterpret_cast<uintptr_t>(p));
+        }
+        signature += shape_signature;
+        shapes = std::hash<std::string>{}(shape_signature);
+        transition = rp.last_shapes * 31 + shapes;
+        if (replay_run(signature, events)) {
+            ++_replay_count;
+            rp.add_time(0, *this, t_start);
             return;
         }
+        if (rp.max_plans == 0) {
+            // Every plan owns a shape_info buffer.
+            const size_t bytes = _shape_info_ptr ? _shape_info_ptr->size() : 1;
+            rp.max_plans = std::min<size_t>(1024, std::max<size_t>(16, (size_t{512} << 20) / std::max<size_t>(bytes, 1)));
+        }
+        if (rp.plans.size() >= rp.max_plans) {
+            rp.plans.clear();
+            _replay_sinfo.clear();
+            ++rp.evictions;
+        }
+        if (rp.dirty) {
+            replay_data::restore(rp.base);
+        }
+        const auto aborts = rp.transition_aborts.find(transition);
+        const bool give_up = aborts != rp.transition_aborts.end() && aborts->second >= 2;
+        replay_swap_shape_info(give_up ? "#scratch" : signature);
+        if (!give_up) {
+            plan = std::make_shared<replay_data::plan>();
+            ++_record_count;
+        } else {
+            ++rp.skipped;
+        }
+    } else if (_record_replay_session) {
+        if (_record_replay_session->replay(events, _exec_order)) {
+            ++_replay_count;
+            return;
+        }
+        ++_record_count;
         _record_replay_session->begin_recording(events);
         is_recording = true;
     }
+    auto begin_segment = [&](const std::vector<event::ptr>& deps) {
+        plan->items.emplace_back();
+        plan->items.back().session = std::make_shared<record_replay_session>(*_stream);
+        plan->items.back().session->begin_recording(deps);
+        seg_open = true;
+    };
+    auto end_segment = [&]() {
+        if (seg_open) {
+            auto& session = plan->items.back().session;
+            session->end_recording();
+            plan_ok = plan_ok && session->valid();
+            seg_open = false;
+        }
+    };
+    if (plan) {
+        begin_segment(events);
+    }
     try {
         set_arguments();
+        if (prim_host_prof_on()) {
+            prim_host_prof().runs[this]++;
+        }
 
         // This extra flush command is needed for dynamic models in both cases of out_of_order / in_order operating mode
         // since it reduces `bubbles` number in pipeline and GPU's idle time by timely flushing new kernels to device.
@@ -1170,12 +1430,53 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
             // Dependency events should not be recorded to the command list
             // As they could propagate to the subsequent replay iteration
             // Instead events were passed to begin_recording()
-            if (!is_recording && inst->is_input()) {
+            if (!is_recording && !plan && inst->is_input()) {
                 inst->add_dep_events(events);
             }
+            const bool live = plan && !abandoned && _rp->live.count(inst.get()) != 0;
+            if (live) {
+                end_segment();
+            }
+            g_rec_cur_prim = &inst->id();
+            // A CPU primitive of a shape_of subgraph reads and writes host data only: its locks keep the recording.
+            std::optional<rec_benign_lock_scope> host_only;
+            if (plan && !abandoned && inst->get_node().is_in_shape_of_subgraph() && inst->get_impl() != nullptr && inst->get_impl()->is_cpu()) {
+                host_only.emplace();
+            }
 
-            inst->prepare_primitive();
-            inst->execute();
+            if (prim_host_prof_on()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                inst->prepare_primitive();
+                const auto t1 = std::chrono::steady_clock::now();
+                inst->execute();
+                const auto t2 = std::chrono::steady_clock::now();
+                const auto ts = inst->desc()->type_string();
+                auto& a = prim_host_prof().by_net[this][ts == "gather" ? "gather:" + inst->id() : ts];
+                a.prep += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                a.exec += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                a.n++;
+            } else {
+                inst->prepare_primitive();
+                inst->execute();
+            }
+
+            host_only.reset();
+            if (plan && !abandoned) {
+                if (live) {
+                    plan->items.back().live = inst;
+                    begin_segment({});
+                } else if (seg_open && _stream->get_recorder()->get_active_command_list() == nullptr) {
+                    // The primitive needed the queue (host read or sync), which ended the segment.
+                    seg_open = false;
+                    plan_ok = false;
+                    if (_rp->add_live(inst.get())) {
+                        live_added = true;
+                        begin_segment({});
+                    } else {
+                        abandoned = true;
+                    }
+                }
+            }
 
             executed_prims++;
             if (needs_flushing && executed_prims % flush_frequency == 0) {
@@ -1187,11 +1488,63 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
             _record_replay_session->end_recording();
             _record_replay_session->invalidate();
         }
+        if (plan && seg_open) {
+            plan->items.back().session->end_recording();
+        }
         throw;
     }
     if (is_recording) {
         _record_replay_session->end_recording();
+        if (!_record_replay_session->valid()) {
+            ++_record_aborted;
+        }
     }
+    if (plan) {
+        end_segment();
+        if (plan_ok) {
+            plan->snap = _rp->snapshot(*this);
+            for (auto& it : plan->items) {
+                for (size_t i = 0; it.live && i < plan->snap.size(); ++i) {
+                    if (plan->snap[i].inst == it.live.get()) {
+                        it.live_state = i;
+                    }
+                }
+            }
+            // Hold every buffer the recording references, so a later reallocation cannot free it.
+            for (const auto& inst : _exec_order) {
+                for (size_t i = 0; i < inst->outputs_memory_count(); ++i) {
+                    if (inst->output_memory_ptr(i)) {
+                        plan->keep.push_back(inst->output_memory_ptr(i));
+                    }
+                }
+                for (const auto& m : inst->get_intermediates_memories()) {
+                    if (m) {
+                        plan->keep.push_back(m);
+                    }
+                }
+            }
+            for (const auto& inst : _outputs) {
+                plan->events.push_back(inst->get_impl_params()->out_event);
+                for (size_t i = 0; i < inst->outputs_memory_count(); ++i) {
+                    plan->outs.push_back({inst.get(), i, inst->get_output_layout(i), inst->output_memory_ptr(i)});
+                }
+            }
+            _rp->plans[signature] = plan;
+        } else {
+            ++_record_aborted;
+            if (!live_added) {
+                ++_rp->transition_aborts[transition];
+            }
+        }
+    }
+    if (_replay_by_shape) {
+        _rp->base = _rp->snapshot(*this);
+        _rp->dirty = false;
+        _rp->last_shapes = shapes;
+        _rp->add_time(plan ? (plan_ok ? 1 : 2) : 3, *this, t_start);
+    }
+    g_rec_cur_prim = nullptr;
+    _replay_force_args = false;
 
     // Using output of previous network as input to another one may cause hazard (in OOOQ mode) if user would not
     // provide proper event to execution. Flushing pipeline should prevent this kind of issues.
@@ -1204,13 +1557,127 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
     }
 }
 
-void network::invalidate_recording() {
+void network::replay_swap_shape_info(const std::string& signature) {
+    if (!_shape_info_ptr || signature == _replay_sinfo_sig) {
+        return;
+    }
+    if (!_replay_sinfo_cur) {
+        _replay_sinfo_cur = _shape_info_ptr;
+    }
+    auto& buf = _replay_sinfo[signature];
+    const bool fresh = !buf;
+    if (fresh) {
+        buf = get_engine().allocate_memory(_shape_info_ptr->get_layout(), false);
+    }
+    // Start from the current contents: primitives whose shape does not change will not rewrite theirs.
+    // The scratch buffer serves many signatures, so it is refreshed on every switch to it.
+    if (fresh || signature == "#scratch") {
+        mem_lock<uint8_t, mem_lock_type::read> src(_replay_sinfo_cur, get_stream());
+        mem_lock<uint8_t, mem_lock_type::write> dst(buf, get_stream());
+        std::memcpy(dst.data(), src.data(), _shape_info_ptr->size());
+    }
+    const int alignment = 512;
+    size_t offset = 0;
+    for (const auto& prim : _exec_order) {
+        const int64_t shape_elements = prim->get_node().get_total_shape_info_size();
+        if (shape_elements == 0) {
+            continue;
+        }
+        prim->set_shape_info_memory(get_engine().create_subbuffer(*buf, layout{{shape_elements}, data_types::i32, format::bfyx}, offset));
+        offset += align_to(shape_elements, alignment) * sizeof(int32_t);
+    }
+    _replay_sinfo_cur = buf;
+    _replay_sinfo_sig = signature;
+    _reset_arguments = true;
+    _replay_force_args = true;
+}
+
+bool network::replay_run(const std::string& signature, const std::vector<event::ptr>& events) {
+    auto& rp = *_rp;
+    const auto found = rp.plans.find(signature);
+    if (found == rp.plans.end()) {
+        return false;
+    }
+    const auto plan = found->second;
+    // The recording writes the output buffers it was made with.
+    for (const auto& o : plan->outs) {
+        const auto cur = o.inst->output_memory_ptr(o.idx);
+        if (!cur || !o.mem || !get_engine().is_the_same_buffer(*cur, *o.mem)) {
+            ++_replay_inval["outmem"];
+            rp.plans.erase(found);
+            return false;
+        }
+    }
+    replay_data::restore(plan->snap);
+    rp.dirty = rp.dirty || !plan->snap.empty();
+    bool first = true;
+    // The event objects of the primitives belong to the last normal run, not to this recording: leave them alone.
+    static const std::list<std::shared_ptr<primitive_inst>> no_prims;
+    for (auto& it : plan->items) {
+        OPENVINO_ASSERT(it.session->replay(first ? events : std::vector<event::ptr>{}, no_prims), "[GPU] replay: invalid segment");
+        first = false;
+        if (!it.live) {
+            continue;
+        }
+        auto& inst = *it.live;
+        const auto& st = plan->snap[it.live_state].st;
+        inst.clear_events();
+        g_rec_cur_prim = &inst.id();
+        inst.prepare_primitive();
+        inst.execute();
+        ++rp.live_runs;
+        bool moved = false;
+        for (size_t i = 0; i < st.mems.size(); ++i) {
+            OPENVINO_ASSERT(inst.get_output_layout(i) == st.lays[i], "[GPU] replay: ", inst.id(), " changed its output layout");
+            const auto cur = inst.output_memory_ptr(i);
+            if (cur && st.mems[i] && !get_engine().is_the_same_buffer(*cur, *st.mems[i])) {
+                // The recorded segments read the buffer of the recording.
+                OPENVINO_ASSERT(cur->size() <= st.mems[i]->size(), "[GPU] replay: ", inst.id(), " moved to a larger output buffer");
+                st.mems[i]->copy_from(get_stream(), *cur, false);
+                moved = true;
+            }
+        }
+        if (moved) {
+            inst.replay_restore(st, true, false);
+            ++rp.fixups;
+        }
+    }
+    for (auto& it : plan->items) {
+        if (it.live) {
+            it.live->reset_flags();
+        }
+    }
+    g_rec_cur_prim = nullptr;
+    _replay_out = &plan->outs;
+    return true;
+}
+
+void network::invalidate_recording(const std::string& reason) {
+    if (_replay_by_shape) {
+        ++_replay_inval[reason];
+        _rp->plans.clear();
+        return;
+    }
     if (_record_replay_session) {
         _record_replay_session->invalidate();
     }
 }
 
 void network::prepare_record_replay() {
+    if (!_internal && std::getenv("OV_GPU_REPLAY") && _stream->get_recorder() != nullptr) {
+        // OV_GPU_REPLAY=N (N > 1): only networks with at most N primitives (e.g. the MTP draft, not the main model).
+        const long max_prims = std::atol(std::getenv("OV_GPU_REPLAY"));
+        if (max_prims > 1 && _exec_order.size() > static_cast<size_t>(max_prims)) {
+            return;
+        }
+        const char* min_env = std::getenv("OV_GPU_REPLAY_MIN");
+        if (min_env && _exec_order.size() < static_cast<size_t>(std::atol(min_env))) {
+            return;
+        }
+        _replay_by_shape = true;
+        _rp = std::make_shared<replay_data>();
+        return;
+    }
     bool use_record_replay = get_config().get_record_replay();
     bool skip_model_check = GPU_DEBUG_VALUE_OR(get_config().get_record_replay_dynamic(), false);
     bool should_use_record_replay = !_internal && (use_record_replay || skip_model_check);

@@ -3,6 +3,7 @@
 //
 
 #include <slice_inst.h>
+#include "intel_gpu/runtime/command_recorder.hpp"
 #include "primitive_type_base.h"
 #include "openvino/op/slice.hpp"
 #include "slice_shape_inference.hpp"
@@ -109,6 +110,7 @@ void slice_inst::update_shape_info_tensor(const kernel_impl_params& params) {
         allocate_shape_info_memory();
     }
 
+    rec_benign_lock_scope benign;
     mem_lock<int32_t> lock(_shape_info_memory, _network.get_stream());
     auto* shape_info_ptr = lock.data();
     size_t offset = 0;
