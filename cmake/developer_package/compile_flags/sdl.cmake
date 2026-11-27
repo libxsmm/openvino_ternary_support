@@ -27,7 +27,8 @@ if(CMAKE_COMPILER_IS_GNUCXX OR OV_COMPILER_IS_CLANG OR (UNIX AND OV_COMPILER_IS_
         endif()
         if (NOT ENABLE_SANITIZER)
             # Remove all symbol table and relocation information from the executable
-            set(OV_LINKER_FLAGS "${OV_LINKER_FLAGS} -s")
+            # scratch: keep symbols
+            #set(OV_LINKER_FLAGS "${OV_LINKER_FLAGS} -s")
         endif()
         if(NOT MINGW AND NOT APPLE)
             set(OV_LINKER_FLAGS "${OV_LINKER_FLAGS} -z noexecstack -z relro -z now")
@@ -40,7 +41,8 @@ if(CMAKE_COMPILER_IS_GNUCXX OR OV_COMPILER_IS_CLANG OR (UNIX AND OV_COMPILER_IS_
             set(OV_C_CXX_FLAGS "${OV_C_CXX_FLAGS} -fstack-protector-all")
             if(NOT ENABLE_SANITIZER AND NOT APPLE AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
                 # Remove all symbol table and relocation information from the executable
-                set(OV_LINKER_FLAGS "${OV_LINKER_FLAGS} -s")
+                # scratch: keep symbols
+                #set(OV_LINKER_FLAGS "${OV_LINKER_FLAGS} -s")
             endif()
         endif()
     elseif(OV_COMPILER_IS_INTEL_LLVM)
