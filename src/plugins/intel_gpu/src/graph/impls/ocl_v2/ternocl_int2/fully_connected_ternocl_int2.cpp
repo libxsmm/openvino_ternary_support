@@ -117,7 +117,50 @@ struct MtTile {
     int mt_m, mt_n, wg_m, wg_n;
 };
 
-GemvTile gemv_tile(size_t K, size_t N, bool integrated) {
+// EXPERIMENT: TERNOCL_GEMV_TILES / TERNOCL_INT8_GEMV_TILES = "K:N:rows:a,b,c;..." override the GEMV tile of a
+// (K, N, sub-group rows) launch; rows = 0 matches every GEMV class. a,b,c = wgn,ls,u (up-convert) or nsg,ls,u (int8).
+struct TileOverride {
+    size_t k, n, rows;
+    int a, b, c;
+};
+
+std::vector<TileOverride> parse_tile_overrides(const char* env) {
+    std::vector<TileOverride> v;
+    if (const char* e = std::getenv(env)) {
+        const std::string s(e);
+        for (size_t pos = 0; pos < s.size();) {
+            const size_t end = std::min(s.find(';', pos), s.size());
+            TileOverride t{};
+            if (std::sscanf(s.substr(pos, end - pos).c_str(), "%zu:%zu:%zu:%d,%d,%d", &t.k, &t.n, &t.rows, &t.a, &t.b, &t.c) == 6) {
+                v.push_back(t);
+            }
+            pos = end + 1;
+        }
+        std::fprintf(stderr, "[ternocl-int2] EXPERIMENT: %s with %zu tiles\n", env, v.size());
+    }
+    return v;
+}
+
+const TileOverride* find_tile_override(const std::vector<TileOverride>& table, size_t K, size_t N, size_t rows) {
+    const TileOverride* any = nullptr;
+    for (const auto& t : table) {
+        if (t.k == K && t.n == N) {
+            if (t.rows == rows) {
+                return &t;
+            }
+            if (t.rows == 0) {
+                any = &t;
+            }
+        }
+    }
+    return any;
+}
+
+GemvTile gemv_tile(size_t K, size_t N, bool integrated, LaunchClass cls) {
+    static const auto overrides = parse_tile_overrides("TERNOCL_GEMV_TILES");
+    if (const auto* t = find_tile_override(overrides, K, N, gemv_rows(cls))) {
+        return GemvTile{t->a, t->b, t->c};
+    }
     struct Entry {
         size_t k, n;
         GemvTile t;
@@ -388,7 +431,7 @@ size_t int8_gemv_min_m() {
     static const size_t v = [] {
         const char* e = std::getenv("TERNOCL_INT8_GEMV_MIN_M");
         const size_t m = e ? static_cast<size_t>(std::atoi(e)) : size_t{0};
-        if (m >= 2) {
+        if (m >= 1) {
             std::fprintf(stderr, "[ternocl-int2] EXPERIMENT: int2 x int8 GEMV for %zu <= M <= 8\n", m);
         }
         return m;
@@ -398,7 +441,7 @@ size_t int8_gemv_min_m() {
 
 bool int8_gemv_class(LaunchClass cls) {
     const size_t m = int8_gemv_min_m();
-    return m >= 2 && is_gemv(cls) && gemv_rows(cls) >= m && cls != LaunchClass::gemv_m1;
+    return m >= 1 && is_gemv(cls) && gemv_rows(cls) >= m;
 }
 
 struct I8GemvTile {
@@ -407,6 +450,10 @@ struct I8GemvTile {
 
 // Arc 140V sweep of the 27B shapes (2 GiB rotating weights), per GEMV class M = 2, <= 4, <= 8.
 I8GemvTile int8_gemv_tile(size_t K, size_t N, LaunchClass cls) {
+    static const auto overrides = parse_tile_overrides("TERNOCL_INT8_GEMV_TILES");
+    if (const auto* t = find_tile_override(overrides, K, N, gemv_rows(cls))) {
+        return I8GemvTile{t->a, t->b, t->c};
+    }
     if (const char* e = std::getenv("TERNOCL_INT8_GEMV_TILE")) {
         I8GemvTile t{4, 4, 2};
         std::sscanf(e, "%d,%d,%d", &t.nsg, &t.ls, &t.u);
@@ -422,7 +469,7 @@ I8GemvTile int8_gemv_tile(size_t K, size_t N, LaunchClass cls) {
         {5120, 16384, {{{2, 4, 2}, {1, 4, 1}, {4, 4, 2}}}},  // in_proj_qkvz
         {6144, 5120, {{{4, 1, 1}, {4, 1, 2}, {4, 8, 1}}}},   // out_proj / o_proj
     };
-    const size_t band = class_index(cls) - 1;
+    const size_t band = cls == LaunchClass::gemv_m1 ? 0 : class_index(cls) - 1;
     for (const auto& e : table) {
         if (e.k == K && e.n == N) {
             return e.t.at(band);
@@ -443,6 +490,26 @@ bool fwht_quant_on() {
         return on;
     }();
     return v;
+}
+
+// SCRATCH: TERNOCL_STATS=1 prints, at exit, FC executions per row count M (9 = more) on the fp16 and int8 kernels.
+struct TernoclStats {
+    std::array<std::array<size_t, 2>, 10> runs{};
+    ~TernoclStats() {
+        for (size_t m = 0; m < runs.size(); ++m) {
+            if (runs[m][0] + runs[m][1] != 0) {
+                std::fprintf(stderr, "[ternocl-stats] M=%zu fp16 %zu int8 %zu\n", m, runs[m][0], runs[m][1]);
+            }
+        }
+    }
+};
+TernoclStats& ternocl_stats() {
+    static TernoclStats s;
+    return s;
+}
+bool ternocl_stats_on() {
+    static const bool on = std::getenv("TERNOCL_STATS") != nullptr;
+    return on;
 }
 
 enum class TernoclKernel { upcvt, quant, int8_gemm, fwht, int8_gemv, fwht_quant };
@@ -484,7 +551,7 @@ public:
             switch (kind) {
             case TernoclKernel::upcvt:
                 if (is_gemv(cls)) {
-                    const auto g = gemv_tile(s.K, s.N, is_integrated(params));
+                    const auto g = gemv_tile(s.K, s.N, is_integrated(params), cls);
                     const size_t wgn = static_cast<size_t>(g.wgn);
                     wgs.local = {wgn * static_cast<size_t>(g.ls), 1, 1};
                     wgs.global = {ceil_div(s.N, wgn) * wgs.local[0], ceil_div(s.M, gemv_rows(cls)), 1};
@@ -575,7 +642,7 @@ protected:
         switch (m_kind) {
         case TernoclKernel::upcvt:
             if (is_gemv(m_cls)) {
-                const auto g = gemv_tile(s.K, s.N, is_integrated(params));
+                const auto g = gemv_tile(s.K, s.N, is_integrated(params), m_cls);
                 opts += " -DSGM=" + std::to_string(gemv_rows(m_cls)) + " -DNSG_N=" + std::to_string(g.wgn / 16) + " -DLS=" + std::to_string(g.ls) +
                         " -DU=" + std::to_string(g.u) + " -DPF=0";
             } else {
@@ -806,6 +873,10 @@ public:
             }
         }
         event::ptr ev;
+        if (ternocl_stats_on()) {
+            const size_t M = fc_shape(*instance.get_impl_params()).M;
+            ternocl_stats().runs[std::min<size_t>(M, 9)][runs_int8(M) ? 1 : 0]++;
+        }
         for (const auto i : get_stages_execution_order(*instance.get_impl_params())) {
             ev = execute_stage(deps, instance, *_stages[i]);
             deps = {ev};
